@@ -23,7 +23,7 @@ For Ollama Cloud, keep `CITIZENS_LLM_URL=https://ollama.com/api/chat` and set th
 
 Secrets may instead be mounted as files with `CITIZENS_LLM_API_KEY_FILE` and `CITIZENS_BRAIN_TOKEN_FILE`. The service rejects configurations that set both a direct value and a file for the same secret. It never logs authorization headers, request bodies, provider payloads, or provider responses.
 
-## Protocol 1
+## Protocol 2
 
 All `/v1/*` requests require `Authorization: Bearer <CITIZENS_BRAIN_TOKEN>` and `Content-Type: application/json`. `GET /healthz` is intentionally unauthenticated for container health checks.
 
@@ -31,7 +31,7 @@ Start a turn with `POST /v1/turn/start`:
 
 ```json
 {
-  "protocol": 1,
+  "protocol": 2,
   "request_id": "a-unique-id-for-retries",
   "citizen": {
     "id": "citizen-uuid",
@@ -39,7 +39,9 @@ Start a turn with `POST /v1/turn/start`:
     "owner_kind": "PLAYER",
     "owner_id": "player-uuid",
     "role": "miner",
-    "faction": "village"
+    "faction": "village",
+    "interaction_mode": "TASK",
+    "persona": "A practical village miner who speaks plainly."
   },
   "actor": {"id": "speaker-uuid", "name": "PlayerName"},
   "prompt": "go collect iron",
@@ -60,17 +62,31 @@ Start a turn with `POST /v1/turn/start`:
 }
 ```
 
+`interaction_mode` is required and accepts exactly `TASK` or `DIALOGUE`.
+`TASK` turns may receive the server's validated world tools. `DIALOGUE` turns must
+send an empty `tools` array; the sidecar omits tools from the Ollama request and
+rejects any tool call a provider nevertheless returns. This makes dialogue-only
+lore characters incapable of initiating world actions through the brain protocol.
+
+`persona` is required but may be an empty string. The authenticated Minecraft
+server supplies it together with name, role, and faction as a trusted character
+profile. The model uses that profile for identity, lore, goals, knowledge, and
+speaking style, while the fixed operational prompt remains authoritative. Persona
+text cannot grant permissions, authorize combat targets, or enable tools. Persona
+length is bounded by `CITIZENS_MAX_PERSONA_CHARS` (4,096 by default, configurable
+up to the hard maximum of 16,384).
+
 The response is either final speech:
 
 ```json
-{"protocol":1,"turn_id":"turn_...","kind":"final","speech":"On it."}
+{"protocol":2,"turn_id":"turn_...","kind":"final","speech":"On it."}
 ```
 
 or one server-validated tool request:
 
 ```json
 {
-  "protocol": 1,
+  "protocol": 2,
   "turn_id": "turn_...",
   "kind": "tool_call",
   "tool_call": {
@@ -85,7 +101,7 @@ After the mod executes that call, it posts the result to `POST /v1/turn/continue
 
 ```json
 {
-  "protocol": 1,
+  "protocol": 2,
   "turn_id": "turn_...",
   "tool_call_id": "call_...",
   "result": {"ok": true, "collected": 8}
@@ -97,13 +113,13 @@ Ollama can request parallel calls. The sidecar persists all of them, emits them 
 Cancel a waiting or executing turn with `POST /v1/turn/cancel`:
 
 ```json
-{"protocol":1,"turn_id":"turn_..."}
+{"protocol":2,"turn_id":"turn_..."}
 ```
 
 If the initial HTTP response was lost before the mod learned `turn_id`, cancel by the original idempotency key instead:
 
 ```json
-{"protocol":1,"request_id":"a-unique-id-for-retries"}
+{"protocol":2,"request_id":"a-unique-id-for-retries"}
 ```
 
 Provide exactly one of `turn_id` or `request_id`. Both forms resolve to the stored turn and repeated cancellation is safe. If request-ID cancellation arrives before start has inserted its row, the sidecar returns `kind: "canceled"` with `turn_id: null` and stores a bounded tombstone. A later start with that request ID is refused, closing the asynchronous stop/start race.

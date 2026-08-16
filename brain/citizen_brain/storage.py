@@ -505,7 +505,7 @@ class SQLiteStore:
             response: dict[str, Any] | None = None
             if remaining:
                 response = {
-                    "protocol": 1,
+                    "protocol": 2,
                     "turn_id": turn_id,
                     "kind": "tool_call",
                     "tool_call": remaining[0],

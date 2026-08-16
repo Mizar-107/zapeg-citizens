@@ -66,7 +66,8 @@ final class BrainHttpClient {
                     .timeout(config.connectTimeout())
                     .build();
             return client.sendAsync(request, boundedUtf8Body())
-                    .thenApply(response -> response.statusCode() == 200);
+                    .thenApply(response -> response.statusCode() == 200
+                            && BrainProtocol.parseHealth(response.body()));
         })
                 .exceptionally(ignored -> false);
     }

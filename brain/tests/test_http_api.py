@@ -65,7 +65,7 @@ class HTTPAPITest(TempDatabaseTest, unittest.TestCase):
     def test_health_is_public_but_turns_require_bearer_auth(self) -> None:
         status, health = self.request("GET", "/healthz")
         self.assertEqual(200, status)
-        self.assertEqual({"protocol": 1, "status": "ok"}, health)
+        self.assertEqual({"protocol": 2, "status": "ok"}, health)
 
         status, error = self.request("POST", "/v1/turn/start", start_payload())
         self.assertEqual(401, status)
@@ -94,6 +94,22 @@ class HTTPAPITest(TempDatabaseTest, unittest.TestCase):
         connection.close()
         self.assertEqual(400, response.status)
         self.assertEqual("invalid_json", document["error"]["code"])
+
+    def test_protocol_one_is_rejected_with_a_protocol_two_error(self) -> None:
+        payload = start_payload()
+        payload["protocol"] = 1
+
+        status, document = self.request(
+            "POST",
+            "/v1/turn/start",
+            payload,
+            token="test-brain-token",
+        )
+
+        self.assertEqual(400, status)
+        self.assertEqual(2, document["protocol"])
+        self.assertEqual("unsupported_protocol", document["error"]["code"])
+        self.assertEqual(0, len(self.provider.calls))
 
 
 if __name__ == "__main__":

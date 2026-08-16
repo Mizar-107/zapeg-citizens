@@ -3,11 +3,14 @@ package io.github.mizar107.zapegcitizens.event;
 import com.dwinovo.numen.entity.NumenPlayer;
 import io.github.mizar107.zapegcitizens.ZapeGCitizens;
 import io.github.mizar107.zapegcitizens.brain.CitizenBrainCoordinator;
+import io.github.mizar107.zapegcitizens.brain.CitizenBrainCoordinator.InteractionMode;
 import io.github.mizar107.zapegcitizens.chat.CitizenChatAddress;
 import io.github.mizar107.zapegcitizens.command.CitizenCommands;
 import io.github.mizar107.zapegcitizens.compat.NumenServerCompat;
 import io.github.mizar107.zapegcitizens.compat.brain.NumenToolGateway;
 import io.github.mizar107.zapegcitizens.data.CitizenRegistryData;
+import io.github.mizar107.zapegcitizens.lifecycle.ServerCitizenLifecycleManager;
+import io.github.mizar107.zapegcitizens.lifecycle.ServerCitizenLifecycleManager.LifecycleResult;
 import net.minecraft.network.chat.Component;
 import net.minecraft.server.level.ServerPlayer;
 import net.minecraftforge.event.RegisterCommandsEvent;
@@ -19,6 +22,7 @@ import net.minecraftforge.event.entity.living.LivingDeathEvent;
 import net.minecraftforge.eventbus.api.SubscribeEvent;
 import net.minecraftforge.eventbus.api.EventPriority;
 import net.minecraftforge.event.server.ServerStoppingEvent;
+import net.minecraftforge.event.server.ServerStartedEvent;
 import net.minecraftforge.event.server.ServerStartingEvent;
 import net.minecraftforge.fml.common.Mod;
 
@@ -66,6 +70,14 @@ public final class CitizenForgeEvents {
     }
 
     @SubscribeEvent
+    public static void onServerStarted(ServerStartedEvent event) {
+        for (LifecycleResult result
+                : ServerCitizenLifecycleManager.instance().start(event.getServer())) {
+            logLifecycleResult("startup", result);
+        }
+    }
+
+    @SubscribeEvent
     public static void onServerChat(ServerChatEvent event) {
         CitizenChatAddress.parse(event.getRawText()).ifPresent(address -> route(event, address));
     }
@@ -86,7 +98,8 @@ public final class CitizenForgeEvents {
             // live player list and emits its own logout lifecycle.
             for (CitizenRegistryData.CitizenRecord record
                     : CitizenRegistryData.get(player.server).ownedBy(player.getUUID())) {
-                NumenPlayer citizen = NumenServerCompat.findLiveOwned(player, record.citizenId());
+                NumenPlayer citizen = NumenServerCompat.findLiveManaged(
+                        player.server, record.citizenId(), record.bodyOwnerId());
                 if (citizen != null) {
                     NumenServerCompat.makeDormant(player.server, citizen);
                 }
@@ -102,7 +115,16 @@ public final class CitizenForgeEvents {
         if (event.getEntity() instanceof NumenPlayer citizen
                 && CitizenRegistryData.get(citizen.server)
                         .findByCitizenId(citizen.getUUID()).isPresent()) {
+            CitizenRegistryData.CitizenRecord record = CitizenRegistryData.get(citizen.server)
+                    .findByCitizenId(citizen.getUUID())
+                    .orElseThrow();
             CitizenBrainCoordinator.instance().bodyUnavailable(citizen, "it died");
+            if (record.logicalOwner().kind() == CitizenRegistryData.OwnerKind.SERVER) {
+                logLifecycleResult(
+                        "death",
+                        ServerCitizenLifecycleManager.instance().onDeath(
+                                citizen.server, record));
+            }
         }
     }
 
@@ -110,15 +132,28 @@ public final class CitizenForgeEvents {
     public static void onServerTick(TickEvent.ServerTickEvent event) {
         if (event.phase == TickEvent.Phase.END) {
             CitizenBrainCoordinator.instance().expireTimedOutTurns(event.getServer());
+            for (LifecycleResult result
+                    : ServerCitizenLifecycleManager.instance().tick(event.getServer())) {
+                logLifecycleResult("tick", result);
+            }
         }
     }
 
     @SubscribeEvent
     public static void onServerStopping(ServerStoppingEvent event) {
+        LAST_TASK_TICK.clear();
         CitizenBrainCoordinator.instance().shutdown(event.getServer());
+        for (LifecycleResult result
+                : ServerCitizenLifecycleManager.instance().shutdown(event.getServer())) {
+            logLifecycleResult("shutdown", result);
+        }
         for (CitizenRegistryData.CitizenRecord record
                 : CitizenRegistryData.get(event.getServer()).all()) {
-            NumenPlayer citizen = NumenServerCompat.findLive(event.getServer(), record.citizenId());
+            if (record.logicalOwner().kind() == CitizenRegistryData.OwnerKind.SERVER) {
+                continue;
+            }
+            NumenPlayer citizen = NumenServerCompat.findLiveManaged(
+                    event.getServer(), record.citizenId(), record.bodyOwnerId());
             if (citizen != null) {
                 NumenServerCompat.makeDormant(event.getServer(), citizen);
             }
@@ -126,42 +161,58 @@ public final class CitizenForgeEvents {
     }
 
     private static void route(ServerChatEvent event, CitizenChatAddress address) {
-        // An explicitly addressed task is private even when it fails authorization/resolution.
-        event.setCanceled(true);
-        ServerPlayer owner = event.getPlayer();
-
-        CitizenRegistryData.CitizenRecord record = CitizenRegistryData.get(owner.server)
+        ServerPlayer actor = event.getPlayer();
+        CitizenRegistryData.CitizenRecord record = CitizenRegistryData.get(actor.server)
                 .findByName(address.citizenName())
-                .filter(candidate -> candidate.logicalOwner().matchesPlayer(owner.getUUID()))
                 .orElse(null);
         if (record == null) {
-            owner.sendSystemMessage(Component.literal(
-                    "[Citizens] You have no live citizen named '" + address.citizenName() + "'."));
+            // Unknown/private-looking addresses do not leak into ordinary public chat.
+            event.setCanceled(true);
+            actor.sendSystemMessage(Component.literal(
+                    "[Citizens] No managed citizen named '" + address.citizenName() + "'."));
             return;
         }
 
-        NumenPlayer citizen = NumenServerCompat.findLiveOwned(owner, record.citizenId());
+        boolean serverOwned = record.logicalOwner().kind()
+                == CitizenRegistryData.OwnerKind.SERVER;
+        if (!serverOwned) {
+            // Player worker tasks stay private, including authorization failures.
+            event.setCanceled(true);
+            if (!record.logicalOwner().matchesPlayer(actor.getUUID())) {
+                actor.sendSystemMessage(Component.literal(
+                        "[Citizens] '" + record.name() + "' is assigned to another player."));
+                return;
+            }
+        }
+
+        NumenPlayer citizen = NumenServerCompat.findLiveManaged(
+                actor.server, record.citizenId(), record.bodyOwnerId());
         if (citizen == null) {
-            owner.sendSystemMessage(Component.literal(
+            actor.sendSystemMessage(Component.literal(
                     "[Citizens] " + record.name() + " is currently dormant or respawning."));
             return;
         }
 
-        if (isStop(address.prompt())) {
-            CitizenBrainCoordinator.instance().stop(owner, record, citizen);
+        if (!serverOwned && isStop(address.prompt())) {
+            CitizenBrainCoordinator.instance().stop(actor, record, citizen);
             return;
         }
 
-        long now = owner.server.overworld().getGameTime();
-        long previous = LAST_TASK_TICK.getOrDefault(owner.getUUID(), Long.MIN_VALUE / 2);
+        long now = actor.server.overworld().getGameTime();
+        long previous = LAST_TASK_TICK.getOrDefault(actor.getUUID(), Long.MIN_VALUE / 2);
         if (now - previous < CHAT_COOLDOWN_TICKS) {
-            owner.sendSystemMessage(Component.literal(
+            actor.sendSystemMessage(Component.literal(
                     "[Citizens] Wait two seconds before sending another task."));
             return;
         }
-        LAST_TASK_TICK.put(owner.getUUID(), now);
+        LAST_TASK_TICK.put(actor.getUUID(), now);
 
-        CitizenBrainCoordinator.instance().submit(owner, record, citizen, address.prompt());
+        CitizenBrainCoordinator.instance().submit(
+                actor,
+                record,
+                citizen,
+                address.prompt(),
+                serverOwned ? InteractionMode.DIALOGUE : InteractionMode.TASK);
     }
 
     private static boolean isStop(String prompt) {
@@ -170,5 +221,17 @@ public final class CitizenForgeEvents {
                 || normalized.equals("cancel")
                 || normalized.equals("dur")
                 || normalized.equals("iptal");
+    }
+
+    private static void logLifecycleResult(String phase, LifecycleResult result) {
+        if (result.successful()) {
+            ZapeGCitizens.LOGGER.info(
+                    "[citizen-lifecycle] phase={} citizen={} status={} detail={}",
+                    phase, result.citizenId(), result.status(), result.message());
+        } else {
+            ZapeGCitizens.LOGGER.warn(
+                    "[citizen-lifecycle] phase={} citizen={} status={} detail={}",
+                    phase, result.citizenId(), result.status(), result.message());
+        }
     }
 }

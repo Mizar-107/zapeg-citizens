@@ -14,7 +14,7 @@ import java.util.regex.Pattern;
 
 final class BrainProtocol {
 
-    static final int VERSION = 1;
+    static final int VERSION = 2;
     static final int MAX_RESPONSE_BYTES = 1_048_576;
     private static final Gson GSON = new Gson();
     private static final Pattern PROTOCOL_IDENTIFIER =
@@ -39,6 +39,8 @@ final class BrainProtocol {
         citizenJson.addProperty("owner_id", citizen.ownerId());
         citizenJson.addProperty("role", citizen.role());
         citizenJson.addProperty("faction", citizen.faction());
+        citizenJson.addProperty("persona", citizen.persona());
+        citizenJson.addProperty("interaction_mode", citizen.interactionMode());
         root.add("citizen", citizenJson);
 
         JsonObject actorJson = new JsonObject();
@@ -129,6 +131,19 @@ final class BrainProtocol {
             throw new BrainProtocolException("tool arguments must be an object", exception);
         }
         return new BrainReply(turnId, kind, null, new ToolCall(id, name, arguments));
+    }
+
+    static boolean parseHealth(String body) {
+        if (body == null || body.length() > MAX_RESPONSE_BYTES) {
+            return false;
+        }
+        try {
+            JsonObject root = JsonParser.parseString(body).getAsJsonObject();
+            return requiredInt(root, "protocol") == VERSION
+                    && "ok".equals(requiredString(root, "status", 16));
+        } catch (RuntimeException ignored) {
+            return false;
+        }
     }
 
     static String parseError(String body) {
@@ -252,7 +267,14 @@ final class BrainProtocol {
     }
 
     record CitizenIdentity(
-            UUID id, String name, String ownerKind, String ownerId, String role, String faction) {}
+            UUID id,
+            String name,
+            String ownerKind,
+            String ownerId,
+            String role,
+            String faction,
+            String persona,
+            String interactionMode) {}
 
     record ActorIdentity(UUID id, String name) {}
 

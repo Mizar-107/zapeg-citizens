@@ -24,13 +24,24 @@ class BrainProtocolTest {
         JsonObject body = JsonParser.parseString(BrainProtocol.startBody(
                 UUID.randomUUID(),
                 new BrainProtocol.CitizenIdentity(
-                        citizenId, "Atlas", "PLAYER", actorId.toString(), "worker", "players"),
+                        citizenId,
+                        "Atlas",
+                        "PLAYER",
+                        actorId.toString(),
+                        "worker",
+                        "players",
+                        "A patient village blacksmith.\nSpeaks plainly.",
+                        "TASK"),
                 new BrainProtocol.ActorIdentity(actorId, "Alice"),
                 "collect iron",
                 tools)).getAsJsonObject();
 
-        assertEquals(1, body.get("protocol").getAsInt());
+        assertEquals(2, body.get("protocol").getAsInt());
         assertEquals(citizenId.toString(), body.getAsJsonObject("citizen").get("id").getAsString());
+        assertEquals("A patient village blacksmith.\nSpeaks plainly.",
+                body.getAsJsonObject("citizen").get("persona").getAsString());
+        assertEquals("TASK",
+                body.getAsJsonObject("citizen").get("interaction_mode").getAsString());
         assertEquals("collect iron", body.get("prompt").getAsString());
         assertEquals(1, body.getAsJsonArray("tools").size());
         assertEquals(false, body.has("token"));
@@ -40,13 +51,13 @@ class BrainProtocolTest {
     @Test
     void parsesFinalAndToolReplies() {
         BrainProtocol.BrainReply finished = BrainProtocol.parseReply("""
-                {"protocol":1,"turn_id":"turn-1","kind":"final","speech":"Done"}
+                {"protocol":2,"turn_id":"turn-1","kind":"final","speech":"Done"}
                 """);
         assertEquals(BrainProtocol.ReplyKind.FINAL, finished.kind());
         assertEquals("Done", finished.speech());
 
         BrainProtocol.BrainReply tool = BrainProtocol.parseReply("""
-                {"protocol":1,"turn_id":"turn-2","kind":"tool_call",
+                {"protocol":2,"turn_id":"turn-2","kind":"tool_call",
                  "tool_call":{"id":"call-1","name":"scan_blocks","arguments":{"radius":8}}}
                 """);
         assertEquals(BrainProtocol.ReplyKind.TOOL_CALL, tool.kind());
@@ -69,20 +80,22 @@ class BrainProtocolTest {
         JsonObject cancel = JsonParser.parseString(
                 BrainProtocol.cancelRequestBody(requestId)).getAsJsonObject();
         assertEquals(requestId.toString(), cancel.get("request_id").getAsString());
+        assertEquals(true, BrainProtocol.parseHealth("{\"protocol\":2,\"status\":\"ok\"}"));
+        assertEquals(false, BrainProtocol.parseHealth("{\"protocol\":1,\"status\":\"ok\"}"));
     }
 
     @Test
     void rejectsUnsupportedOrMalformedReplies() {
         assertThrows(BrainProtocol.BrainProtocolException.class,
                 () -> BrainProtocol.parseReply(
-                        "{\"protocol\":2,\"turn_id\":\"x\",\"kind\":\"final\",\"speech\":\"ok\"}"));
+                        "{\"protocol\":1,\"turn_id\":\"x\",\"kind\":\"final\",\"speech\":\"ok\"}"));
         assertThrows(BrainProtocol.BrainProtocolException.class,
                 () -> BrainProtocol.parseReply(
-                        "{\"protocol\":1,\"turn_id\":\"x\",\"kind\":\"tool_call\"}"));
+                        "{\"protocol\":2,\"turn_id\":\"x\",\"kind\":\"tool_call\"}"));
         assertThrows(BrainProtocol.BrainProtocolException.class,
                 () -> BrainProtocol.parseReply("not-json"));
         assertEquals("turn is canceled", BrainProtocol.parseError(
-                "{\"protocol\":1,\"error\":{\"code\":\"turn_not_active\","
+                "{\"protocol\":2,\"error\":{\"code\":\"turn_not_active\","
                         + "\"message\":\"turn is canceled\"}}"));
     }
 
@@ -90,19 +103,19 @@ class BrainProtocolTest {
     void rejectsCoercedTypesAndControlCharacters() {
         assertThrows(BrainProtocol.BrainProtocolException.class,
                 () -> BrainProtocol.parseReply(
-                        "{\"protocol\":\"1\",\"turn_id\":\"turn-1\","
+                        "{\"protocol\":\"2\",\"turn_id\":\"turn-1\","
                                 + "\"kind\":\"final\",\"speech\":\"ok\"}"));
         assertThrows(BrainProtocol.BrainProtocolException.class,
                 () -> BrainProtocol.parseReply(
-                        "{\"protocol\":1,\"turn_id\":7,\"kind\":\"final\","
+                        "{\"protocol\":2,\"turn_id\":7,\"kind\":\"final\","
                                 + "\"speech\":\"ok\"}"));
         BrainProtocol.BrainReply multiline = BrainProtocol.parseReply(
-                "{\"protocol\":1,\"turn_id\":\"turn-1\",\"kind\":\"final\","
+                "{\"protocol\":2,\"turn_id\":\"turn-1\",\"kind\":\"final\","
                         + "\"speech\":\"first line\\n\\tsecond line\"}");
         assertEquals("first line second line", multiline.speech());
         assertThrows(BrainProtocol.BrainProtocolException.class,
                 () -> BrainProtocol.parseReply(
-                        "{\"protocol\":1,\"turn_id\":\"turn-1\",\"kind\":\"tool_call\","
+                        "{\"protocol\":2,\"turn_id\":\"turn-1\",\"kind\":\"tool_call\","
                                 + "\"tool_call\":{\"id\":\"call-1\",\"name\":\"mine\\nforged\","
                                 + "\"arguments\":{}}}"));
         assertEquals("bad header", BrainProtocol.parseError(

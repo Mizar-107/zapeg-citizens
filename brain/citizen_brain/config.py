@@ -66,6 +66,7 @@ class Settings:
     max_body_bytes: int
     max_provider_bytes: int
     max_prompt_chars: int
+    max_persona_chars: int
     max_result_chars: int
     max_speech_chars: int
     max_tool_description_chars: int
@@ -114,6 +115,9 @@ class Settings:
                 values, "CITIZENS_MAX_PROVIDER_BYTES", 1_048_576, 4_096, 8_388_608
             ),
             max_prompt_chars=_integer(values, "CITIZENS_MAX_PROMPT_CHARS", 8_000, 1, 64_000),
+            max_persona_chars=_integer(
+                values, "CITIZENS_MAX_PERSONA_CHARS", 4_096, 1, 16_384
+            ),
             max_result_chars=_integer(values, "CITIZENS_MAX_RESULT_CHARS", 16_000, 1, 128_000),
             max_speech_chars=_integer(values, "CITIZENS_MAX_SPEECH_CHARS", 2_048, 1, 2_048),
             max_tool_description_chars=_integer(

@@ -36,6 +36,30 @@ the shared bridge is configured, and an operator can permanently remove a citize
 with `/citizen remove Atlas`. Removing a live citizen drops its inventory at its
 feet before deleting the body and reservation.
 
+## Server-owned lore citizens
+
+An operator can create a citizen that belongs to the world rather than a player:
+
+```text
+/citizen spawn-server Edda lore village An old road warden who remembers every traveler.
+```
+
+Any player can then speak to Edda in ordinary public chat with `@Edda <message>`.
+The addressed message remains public, the reply is broadcast as `[Edda] ...`, and
+conversation memory stays isolated per player. Public lore dialogue receives no
+world tools. An in-game operator can deliberately assign physical work—with all 32
+server-capable Numen tools—using `/citizen task Edda <task>`, and cancel it with
+`/citizen stop Edda`.
+
+Server citizens have a persistent persona, role, faction, technical owner, and home
+anchor. `/citizen persona Edda <text>` changes the profile for future turns;
+`/citizen set-home Edda` moves its recovery anchor to the command source; and
+`/citizen wake Edda` retries lifecycle reconciliation. Healthy server citizens stay
+awake without a human owner, keep the same UUID and inventory across restarts, and
+recover at home 30 seconds after death. Each always-awake body refreshes Numen's
+radius-two chunk ticket, so use this lifecycle for a modest number of important lore
+characters rather than ordinary enemy populations.
+
 ## One key, not one key per player
 
 The provider key exists only in the brain container's environment or secret file.
@@ -63,8 +87,8 @@ client pack.
   dedicated-server bridge, including building, combat, item transfers, blueprints,
   and container interaction. Numen's `todowrite` and `load_skill` remain excluded
   because they are client-only helpers with no dedicated-server execution context.
-- `@Name stop`, logout, bridge failure, and server shutdown cancel pending result
-  routes and Numen body work.
+- Player `@Name stop`, operator `/citizen stop Name`, logout, bridge failure, and
+  server shutdown cancel pending result routes and Numen body work.
 - Pinned Mixin hooks capture completed Numen tasks for the host brain, reject
   independent client tool/cancel/dismiss control of managed bodies, and block stock
   summons that could bypass global name reservations.
@@ -90,19 +114,19 @@ yet expose a server-side result sink.
 
 ## Current scope
 
-Player-owned workers are the first supported lifecycle: the logical owner must be
-online to issue work, and the body becomes dormant when that player logs out. The
-registry already separates logical owner, technical Numen owner, brain controller,
-role, and faction so server-owned lore characters can be added without migrating the
-data model again.
+Player-owned workers and always-awake server-owned lore citizens are supported.
+Player workers become dormant when their owner logs out. Server citizens use a
+world-specific technical principal, keep their body ticket refreshed, snapshot
+their last position, hibernate during orderly shutdown, and wake or recover with
+the same identity when the server returns.
 
 Stock Numen summon/despawn commands and G-panel summoning are gated; operators use
 the managed spawn/remove commands instead. Adoption/reconciliation of companions
-created before this addon, true server-owned spawning, offline chunk lifecycle,
-home-based death recovery, faction/ally-aware combat validation, and full ATM9
-validation remain follow-up work. Raw Numen combat is available to managed citizens;
-the addon does not yet add faction or friendly-fire rules around it. Common enemies
-and boss combat should use deterministic mob/state machine AI; see
+created before this addon, proximity-based hibernation, scheduled autonomous work,
+faction/ally-aware combat validation, and full ATM9 validation remain follow-up
+work. Raw Numen combat is available to operator-assigned tasks; the addon does not
+yet add faction or friendly-fire rules around it. Common enemies and boss combat
+should use deterministic mob/state machine AI; see
 [lore NPC guidance](docs/lore-npcs.md).
 
 ## Build and test

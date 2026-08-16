@@ -18,6 +18,11 @@ HTTP calls run asynchronously. Entity lookup, tool invocation, cancellation, and
 other world mutations run on the Minecraft server thread. The brain initiates no
 connection to Minecraft and receives no RCON, log, filesystem, or raw-command access.
 
+A server-owned lore turn uses the same transport with `interaction_mode=DIALOGUE`
+and an empty tool array. The player's addressed message and `[Name]` response remain
+public, while SQLite history is still keyed by exact citizen and actor UUID. An OP
+`/citizen task` turn uses `interaction_mode=TASK` and the complete server tool schema.
+
 Cancellation is immediately authoritative for the Forge result route and Numen body.
 The mod also requests sidecar cancellation, but that remote step is best-effort when
 the sidecar is unreachable. A failed remote cancel is audit-logged; the stale row is
@@ -30,9 +35,10 @@ late result cannot regain world authority.
 The world `SavedData` ledger is authoritative for:
 
 - globally case-folded citizen name and UUID;
-- logical owner (`PLAYER` or future `SERVER` principal);
+- logical owner (`PLAYER` or `SERVER` principal);
 - separate technical Numen body-owner UUID;
-- brain controller, role, and faction.
+- brain controller, role, faction, persona, and optional home anchor;
+- one world-specific technical principal for headless Numen bodies.
 
 Numen persists the fake player's location, inventory, skin, and death state. The
 sidecar's SQLite database stores bounded conversation history by `(citizen UUID,
@@ -42,8 +48,15 @@ The sidecar may request only schemas supplied by Forge. Forge independently reje
 anything outside its compiled worker allowlist, and Numen's typed server tool parses
 and validates the arguments. Managed bodies reject Numen's ordinary client-originated
 tool and cancellation payloads so two brains cannot drive one body. Numen's stock
-summon/despawn lifecycle is gated, and only operator `/citizen spawn` and
-`/citizen remove` mutate the managed namespace.
+summon/despawn lifecycle is gated, and only operator `/citizen spawn`,
+`/citizen spawn-server`, and `/citizen remove` mutate the managed namespace.
+
+Server-owned bodies are reconciled after levels load. The addon validates both the
+live body and Numen's persistent owner row, refreshes Numen's expiring radius-two
+chunk ticket every tick, snapshots changed positions every 100 ticks, and hibernates
+them during orderly shutdown. A dead row is recreated with the same UUID at its
+validated home after 600 ticks. Missing or mismatched Numen identity data is
+quarantined rather than silently replaced.
 
 ## Compatibility boundary
 
@@ -78,7 +91,14 @@ The long-term fix is an upstream public server result-sink API.
 12. Try dropped-item pickup, then low-risk mining with tools already supplied.
 13. Run `/citizen remove Atlas`; verify its inventory drops, body and roster entry
     disappear, and the name can be reserved again.
-14. Repeat on a copied ZapeG/ATM9 world and test FTB Chunks claims before live rollout.
+14. Run `/citizen spawn-server Edda lore village <persona>` and verify that two
+    players can talk publicly while receiving separate conversation histories.
+15. Ask Edda to mine through public `@Edda` chat; verify no tool call is supplied.
+    Then run `/citizen task Edda <task>` as an OP and verify physical execution.
+16. Restart the server; verify Edda returns with the same UUID and inventory. Kill
+    Edda in a copied world and verify home recovery after 600 ticks.
+17. Repeat on a copied ZapeG/ATM9 world and test FTB Chunks claims, graves, and
+    always-awake chunk cost before live rollout.
 
 The live server remains gated on this two-client and ATM9 smoke test. Do not point an
 experimental build at the production world data directory.

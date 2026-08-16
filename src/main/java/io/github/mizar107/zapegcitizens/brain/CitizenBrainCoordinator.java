@@ -1,12 +1,14 @@
 package io.github.mizar107.zapegcitizens.brain;
 
 import com.dwinovo.numen.entity.NumenPlayer;
+import com.google.gson.JsonArray;
 import io.github.mizar107.zapegcitizens.ZapeGCitizens;
 import io.github.mizar107.zapegcitizens.brain.BrainProtocol.ActorIdentity;
 import io.github.mizar107.zapegcitizens.brain.BrainProtocol.BrainReply;
 import io.github.mizar107.zapegcitizens.brain.BrainProtocol.CitizenIdentity;
 import io.github.mizar107.zapegcitizens.brain.BrainProtocol.ReplyKind;
 import io.github.mizar107.zapegcitizens.brain.BrainProtocol.ToolCall;
+import io.github.mizar107.zapegcitizens.compat.NumenServerCompat;
 import io.github.mizar107.zapegcitizens.compat.brain.NumenToolGateway;
 import io.github.mizar107.zapegcitizens.data.CitizenRegistryData;
 import net.minecraft.network.chat.Component;
@@ -85,6 +87,15 @@ public final class CitizenBrainCoordinator {
             CitizenRegistryData.CitizenRecord record,
             NumenPlayer citizen,
             String prompt) {
+        return submit(actor, record, citizen, prompt, InteractionMode.TASK);
+    }
+
+    public boolean submit(
+            ServerPlayer actor,
+            CitizenRegistryData.CitizenRecord record,
+            NumenPlayer citizen,
+            String prompt,
+            InteractionMode mode) {
         if (http == null) {
             tell(actor, "[Citizens] The shared brain is not configured. Ask the server host to start it.");
             return false;
@@ -101,17 +112,28 @@ public final class CitizenBrainCoordinator {
                 actor.getGameProfile().getName(),
                 record,
                 citizen.getUUID(),
+                mode,
                 System.nanoTime());
         if (active.putIfAbsent(citizen.getUUID(), turn) != null) {
-            tell(actor, "[Citizens] " + record.name()
-                    + " is already handling a task. Use @" + record.name() + " stop first.");
+            tell(actor, mode == InteractionMode.DIALOGUE
+                    ? "[Citizens] " + record.name()
+                            + " is already speaking with someone. Please wait."
+                    : record.logicalOwner().kind() == CitizenRegistryData.OwnerKind.SERVER
+                            ? "[Citizens] " + record.name()
+                                    + " is already handling a task. An operator can use "
+                                    + "/citizen stop " + record.name() + "."
+                            : "[Citizens] " + record.name()
+                                    + " is already handling a task. Use @"
+                                    + record.name() + " stop first.");
             return false;
         }
 
         ZapeGCitizens.LOGGER.info(
-                "[citizen-audit] accepted request={} actor={} citizen={} prompt_chars={}",
-                turn.requestId, turn.actorId, turn.citizenId, prompt.length());
-        tell(actor, "[Citizens] Task accepted for " + record.name() + ".");
+                "[citizen-audit] accepted request={} actor={} citizen={} mode={} prompt_chars={}",
+                turn.requestId, turn.actorId, turn.citizenId, mode, prompt.length());
+        if (mode == InteractionMode.TASK) {
+            tell(actor, "[Citizens] Task accepted for " + record.name() + ".");
+        }
 
         CitizenIdentity identity = new CitizenIdentity(
                 record.citizenId(),
@@ -119,13 +141,18 @@ public final class CitizenBrainCoordinator {
                 record.logicalOwner().kind().name(),
                 record.logicalOwner().id(),
                 record.role(),
-                record.faction());
+                record.faction(),
+                record.persona(),
+                mode.name());
+        JsonArray tools = mode == InteractionMode.TASK
+                ? NumenToolGateway.toolDefinitions()
+                : new JsonArray();
         awaitHttp(turn, () -> http.start(
                 turn.requestId,
                 identity,
                 new ActorIdentity(turn.actorId, turn.actorName),
                 prompt.strip(),
-                NumenToolGateway.toolDefinitions()));
+                tools));
         return true;
     }
 
@@ -153,7 +180,8 @@ public final class CitizenBrainCoordinator {
 
     public void stopForLogout(MinecraftServer server, UUID ownerId) {
         for (ActiveTurn turn : active.values()) {
-            if (turn.record.logicalOwner().matchesPlayer(ownerId)) {
+            if (turn.actorId.equals(ownerId)
+                    || turn.record.logicalOwner().matchesPlayer(ownerId)) {
                 cancelWithoutMessage(turn, "owner logged out");
             }
         }
@@ -179,7 +207,9 @@ public final class CitizenBrainCoordinator {
     }
 
     /** Cancel any logical/physical work before an operator permanently removes a citizen. */
-    public void stopForRemoval(MinecraftServer server, UUID citizenId) {
+    public void stopForRemoval(
+            MinecraftServer server, CitizenRegistryData.CitizenRecord record) {
+        UUID citizenId = record.citizenId();
         ActiveTurn turn = active.get(citizenId);
         if (turn != null) {
             cancelWithoutMessage(turn, "operator requested removal");
@@ -187,7 +217,8 @@ public final class CitizenBrainCoordinator {
                     + " was stopped by an operator.");
         }
         if (turn == null) {
-            NumenPlayer citizen = NumenPlayer.findByUuid(server, citizenId);
+            NumenPlayer citizen = NumenServerCompat.findLiveManaged(
+                    server, citizenId, record.bodyOwnerId());
             if (citizen != null) {
                 NumenToolGateway.cancelBody(citizen);
             }
@@ -274,7 +305,17 @@ public final class CitizenBrainCoordinator {
             ZapeGCitizens.LOGGER.info(
                     "[citizen-audit] completed request={} citizen={} tool_steps={}",
                     turn.requestId, turn.citizenId, turn.toolSteps);
-            tellActor(turn, "[" + turn.record.name() + "] " + reply.speech());
+            String speech = "[" + turn.record.name() + "] " + reply.speech();
+            if (turn.mode == InteractionMode.DIALOGUE) {
+                turn.server.getPlayerList().broadcastSystemMessage(Component.literal(speech), false);
+            } else {
+                tellActor(turn, speech);
+            }
+            return;
+        }
+
+        if (turn.mode == InteractionMode.DIALOGUE) {
+            fail(turn, "dialogue mode cannot execute world tools");
             return;
         }
 
@@ -287,7 +328,8 @@ public final class CitizenBrainCoordinator {
             fail(turn, "the brain omitted its tool call");
             return;
         }
-        NumenPlayer citizen = NumenPlayer.findByUuid(turn.server, turn.citizenId);
+        NumenPlayer citizen = NumenServerCompat.findLiveManaged(
+                turn.server, turn.citizenId, turn.record.bodyOwnerId());
         if (citizen == null) {
             fail(turn, "the citizen is no longer live");
             return;
@@ -334,7 +376,8 @@ public final class CitizenBrainCoordinator {
         if (turn.executionId != null) {
             NumenToolGateway.cancelExecution(turn.executionId);
         }
-        NumenPlayer citizen = NumenPlayer.findByUuid(turn.server, turn.citizenId);
+        NumenPlayer citizen = NumenServerCompat.findLiveManaged(
+                turn.server, turn.citizenId, turn.record.bodyOwnerId());
         if (citizen != null) {
             NumenToolGateway.cancelBody(citizen);
         }
@@ -355,7 +398,8 @@ public final class CitizenBrainCoordinator {
         if (turn.executionId != null) {
             NumenToolGateway.cancelExecution(turn.executionId);
         }
-        NumenPlayer citizen = NumenPlayer.findByUuid(turn.server, turn.citizenId);
+        NumenPlayer citizen = NumenServerCompat.findLiveManaged(
+                turn.server, turn.citizenId, turn.record.bodyOwnerId());
         if (citizen != null) {
             NumenToolGateway.cancelBody(citizen);
         }
@@ -424,6 +468,7 @@ public final class CitizenBrainCoordinator {
         private final String actorName;
         private final CitizenRegistryData.CitizenRecord record;
         private final UUID citizenId;
+        private final InteractionMode mode;
         private final long startedNanos;
         private String turnId;
         private String executionId;
@@ -438,6 +483,7 @@ public final class CitizenBrainCoordinator {
                 String actorName,
                 CitizenRegistryData.CitizenRecord record,
                 UUID citizenId,
+                InteractionMode mode,
                 long startedNanos) {
             this.requestId = requestId;
             this.server = server;
@@ -445,7 +491,13 @@ public final class CitizenBrainCoordinator {
             this.actorName = actorName;
             this.record = record;
             this.citizenId = citizenId;
+            this.mode = mode;
             this.startedNanos = startedNanos;
         }
+    }
+
+    public enum InteractionMode {
+        TASK,
+        DIALOGUE
     }
 }

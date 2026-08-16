@@ -84,7 +84,7 @@ def start_payload(
     prompt: str = "collect iron",
 ) -> dict[str, Any]:
     return {
-        "protocol": 1,
+        "protocol": 2,
         "request_id": request_id,
         "citizen": {
             "id": "citizen-1",
@@ -93,6 +93,8 @@ def start_payload(
             "owner_id": "owner-1",
             "role": "miner",
             "faction": "village",
+            "interaction_mode": "TASK",
+            "persona": "A practical village miner who speaks plainly.",
         },
         "actor": {"id": actor_id, "name": "Player"},
         "prompt": prompt,

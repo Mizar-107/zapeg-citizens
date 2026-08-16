@@ -1,7 +1,7 @@
 # Lore characters, enemies, and bosses
 
-Server-owned citizens are feasible, but Numen 0.1.1 cannot safely model them by
-passing a null owner. It assumes a human owner UUID for persistence, chunk loading,
+Server-owned citizens are supported, but Numen 0.1.1 cannot safely model them by
+passing a null owner. It assumes an owner UUID for persistence, chunk loading,
 death recovery, roster sync, and client result delivery.
 
 The registry therefore separates three concerns now:
@@ -10,10 +10,17 @@ The registry therefore separates three concerns now:
 - **brain controller**: the shared server brain;
 - **faction**: allegiance and target policy.
 
-A later `/citizen spawn-server` path can use a stable technical UUID while this addon
-supplies home-based spawn/respawn, proximity/task chunk tickets, conversation access,
-and server result routing. That lifecycle is deliberately not exposed until it is
-safe across restarts and deaths.
+`/citizen spawn-server` therefore uses a stable world-specific technical UUID while
+this addon supplies home-based spawn/recovery, continuously refreshed chunk tickets,
+public dialogue, private per-player memory, and server result routing. The body keeps
+its UUID and inventory across orderly restarts. Death recovery waits 600 ticks, checks
+that the configured home has standing room, and fails closed if Numen's persisted
+owner identity no longer matches.
+
+Public `@Name` conversation is deliberately dialogue-only. Operators use
+`/citizen task <name> <prompt>` when a lore citizen should move, build, fight, or use
+containers. This makes character conversation predictable while retaining the full
+Numen tool surface for authored events.
 
 ## Recommended body and brain by role
 
@@ -26,10 +33,10 @@ safe across restarts and deaths.
 | Boss | Scripted/custom entity and deterministic phases; LLM only for dialogue or bounded strategic choices |
 
 Numen's melee and ranged actuators have real pathfinding, cooldown, aiming, and
-retreat behavior, so a future guard can be useful. They currently accept raw entity
-targets, lack faction/friendly-fire policy, and can inherit navigation that breaks or
-places blocks. The unrestricted player-worker profile exposes these raw combat tools;
-future server-owned guards still need deterministic faction and target selection.
+retreat behavior, so an operator-controlled guard can already be useful. They accept
+raw entity targets, lack faction/friendly-fire policy, and can inherit navigation
+that breaks or places blocks. Automated guards still need deterministic faction and
+target selection before they can choose fights without an operator.
 
 Real-time boss actions must never wait for a model response. A server state machine
 keeps the fight responsive and fair when Ollama is slow or unavailable; the LLM can
@@ -38,9 +45,11 @@ phase strategies.
 
 ## Safe implementation order
 
-1. Prove shared-brain player workers and cancellation.
-2. Add home anchors, server-owned wake/hibernate, and death recovery.
-3. Add faction relationships and a server-side target validator.
-4. Add guards with deterministic target selection and Numen combat actuation.
-5. Try one restricted humanoid rival in an arena.
-6. Keep ordinary enemy populations and boss mechanics deterministic.
+1. Prove shared-brain player workers and cancellation. *(Complete.)*
+2. Add personas, home anchors, server-owned wake/hibernate, and death recovery.
+   *(Complete.)*
+3. Add proximity hibernation and schedules for larger lore populations.
+4. Add faction relationships and a server-side target validator.
+5. Add guards with deterministic target selection and Numen combat actuation.
+6. Try one humanoid rival in an arena.
+7. Keep ordinary enemy populations and boss mechanics deterministic.

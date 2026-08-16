@@ -33,6 +33,7 @@ class SettingsTest(unittest.TestCase):
         )
         self.assertEqual(2_048, configured.max_speech_chars)
         self.assertEqual(4_096, configured.max_tool_description_chars)
+        self.assertEqual(4_096, configured.max_persona_chars)
         self.assertEqual(86_400, configured.terminal_turn_ttl_seconds)
         self.assertEqual(1_000, configured.max_terminal_turns)
 
@@ -72,6 +73,25 @@ class SettingsTest(unittest.TestCase):
                     "CITIZENS_LLM_MODEL": "model",
                     "CITIZENS_BRAIN_TOKEN": "token",
                     "CITIZENS_MAX_TOOL_DESCRIPTION_CHARS": "65537",
+                }
+            )
+
+    def test_persona_limit_is_configurable_but_bounded(self) -> None:
+        configured = Settings.from_env(
+            {
+                "CITIZENS_LLM_MODEL": "model",
+                "CITIZENS_BRAIN_TOKEN": "token",
+                "CITIZENS_MAX_PERSONA_CHARS": "8192",
+            }
+        )
+        self.assertEqual(8_192, configured.max_persona_chars)
+
+        with self.assertRaisesRegex(ValueError, "between 1 and 16384"):
+            Settings.from_env(
+                {
+                    "CITIZENS_LLM_MODEL": "model",
+                    "CITIZENS_BRAIN_TOKEN": "token",
+                    "CITIZENS_MAX_PERSONA_CHARS": "16385",
                 }
             )
 

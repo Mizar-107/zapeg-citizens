@@ -69,8 +69,9 @@ be omitted from clients; Numen still has client components and remains in the pa
 ## Local versus host operation
 
 The host deployment is the production choice: it stays available with the server,
-keeps the key in one administrative boundary, and is ready for future server-owned
-characters. Running the brain on the project owner's PC is appropriate for testing.
+keeps the key in one administrative boundary, and keeps server-owned characters
+available without a player's client acting as their brain. Running the brain on the
+project owner's PC is appropriate for testing.
 For a remote Minecraft host, connect the two through a private authenticated network
 such as Tailscale or an SSH tunnel. Do not open the brain listener to the internet.
 
@@ -85,3 +86,7 @@ such as Tailscale or an SSH tunnel. Do not open the brain listener to the intern
 7. Versioned prerelease jar and reviewed server/client pin update.
 
 Keep the current live server untouched until all seven stages pass.
+
+The server-owned release uses brain document protocol 2. Deploy its Forge jar and
+matching brain image together: a protocol-2 mod intentionally rejects an older
+protocol-1 brain health response before accepting tasks.
