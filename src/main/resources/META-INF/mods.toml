@@ -8,6 +8,7 @@ version = "${mod_version}"
 displayName = "${mod_name}"
 authors = "${mod_authors}"
 description = '''${mod_description}'''
+displayTest = "IGNORE_SERVER_VERSION"
 
 [[dependencies.${mod_id}]]
 modId = "forge"
@@ -28,11 +29,11 @@ modId = "numen"
 mandatory = true
 versionRange = "[${numen_version}]"
 ordering = "AFTER"
-side = "BOTH"
+side = "SERVER"
 
 [[dependencies.${mod_id}]]
 modId = "numen_api"
 mandatory = true
 versionRange = "[0.0.8-SNAPSHOT]"
 ordering = "AFTER"
-side = "BOTH"
+side = "SERVER"

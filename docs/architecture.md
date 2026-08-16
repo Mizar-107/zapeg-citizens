@@ -1,64 +1,84 @@
-# Architecture and smoke-test contract
+# Architecture and verification contract
 
-## Flow
+## Turn flow
 
 ```text
-OP /citizen spawn Atlas Alice
-  -> dedicated server creates a Numen fake ServerPlayer owned by Alice's UUID
-  -> addon reserves case-folded name + citizen UUID + owner UUID in world SavedData
-  -> Numen persists UUID, owner, location, inventory, and death state
-  -> server syncs Alice's roster and tells her client the citizen is ready
-
 Alice: @Atlas go collect iron
-  -> Forge ServerChatEvent parses and cancels the addressed message
-  -> server resolves a managed UUID and verifies Alice is its owner
-  -> private S2C packet carries (citizen UUID, prompt) to Alice only
-  -> client calls NumenGateway.enqueue
-  -> Numen's LLM loop plans and sends owner-authenticated tool requests
-  -> fake-player body moves and acts on the server
+  -> Forge cancels the addressed public chat message
+  -> registry verifies Alice is Atlas's logical owner
+  -> shared-brain HTTP request carries identities, prompt, and allowed tool schemas
+  -> Ollama returns one or more function calls
+  -> Forge resolves each exact allowlisted Numen tool on Atlas's managed UUID
+  -> Numen moves/mines/crafts on the dedicated server
+  -> pinned task-result hook returns the typed outcome to the shared brain
+  -> loop ends with a private [Atlas] response to Alice
 ```
 
-The explicit `@Name` prefix prevents incidental chat from spending tokens or causing
-world actions. A two-second owner cooldown is enforced before forwarding.
+HTTP calls run asynchronously. Entity lookup, tool invocation, cancellation, and all
+other world mutations run on the Minecraft server thread. The brain initiates no
+connection to Minecraft and receives no RCON, log, filesystem, or raw-command access.
 
-## Trust boundary
+Cancellation is immediately authoritative for the Forge result route and Numen body.
+The mod also requests sidecar cancellation, but that remote step is best-effort when
+the sidecar is unreachable. A failed remote cancel is audit-logged; the stale row is
+released by the sidecar's active-turn TTL (15 minutes by default) when API activity
+resumes. Any already-running Ollama request may finish and consume a call, but its
+late result cannot regain world authority.
 
-The server is authoritative for OP permission, the managed-citizen ledger, ownership,
-and prompt routing. The ledger is stored in the overworld's `SavedData` and therefore
-travels with the world backup. Stock-created Numen companions are not accepted by the
-`@Name` router.
-The owner client holds its own provider key and performs LLM inference. Numen remains
-authoritative for tool-call ownership checks and body execution. No Mineflayer login,
-Forge handshake emulation, RCON, or raw server-command surface is involved.
+## Authority and persistence
 
-## Beta boundary
+The world `SavedData` ledger is authoritative for:
 
-`NumenGateway` and `NumenPlayer` are public API. Numen 0.1.1 does not expose a public
-server spawn-for-owner method, so `NumenServerCompat` temporarily calls internal
-`Companions.summon` and `Companions.syncRosterToOwner` from API 0.0.8-SNAPSHOT. Keep
-these versions exact and replace that adapter when Numen publishes a server lifecycle
-gateway. Client provider auto-selection also touches Numen internals and is deliberately
-confined to `ClientPacketHandlers`.
+- globally case-folded citizen name and UUID;
+- logical owner (`PLAYER` or future `SERVER` principal);
+- separate technical Numen body-owner UUID;
+- brain controller, role, and faction.
 
-## Smoke test before ATM9
+Numen persists the fake player's location, inventory, skin, and death state. The
+sidecar's SQLite database stores bounded conversation history by `(citizen UUID,
+actor UUID)`. World and conversation backups therefore have separate lifecycles.
 
-1. Start a copied/throwaway Forge 47.4.10 world with exact Numen 0.1.1 and this addon.
-2. Configure one low-cost provider in Alice's Numen panel.
-3. As console/OP run `/citizen spawn Atlas Alice`; verify Atlas appears once.
-4. Repeat the command with `atlas`; verify no second UUID is created.
-5. Alice sends `@Atlas follow me for 20 blocks`; verify it is not public chat and Atlas acts.
-6. Bob sends `@Atlas follow me`; verify Bob gets a private denial and no agent turn starts.
-7. Alice sends ordinary chat; verify it remains ordinary chat.
-8. Disconnect Alice; verify Atlas becomes dormant. Reconnect and verify its UUID,
-   inventory, and position persist.
-9. Try a dropped-item pickup, then low-risk mining with tools already supplied.
-10. Only after those pass, test one citizen in an unclaimed area of a copied ZapeG world.
+The sidecar may request only schemas supplied by Forge. Forge independently rejects
+anything outside its compiled worker allowlist, and Numen's typed server tool parses
+and validates the arguments. Managed bodies reject Numen's ordinary client-originated
+tool and cancellation payloads so two brains cannot drive one body. Numen's stock
+summon/despawn lifecycle is gated, and only operator `/citizen spawn` and
+`/citizen remove` mutate the managed namespace.
 
-## Next engineering slice
+## Compatibility boundary
 
-- Disable or policy-gate Numen's stock summon/dismiss paths so only `/citizen` controls lifecycle.
-- Add an admin adoption/reconciliation command for any Numen bodies created before the ledger.
-- Add `/citizen remove`, `/citizen stop`, quotas, audit persistence, and queue caps.
-- Cancel work and make bodies dormant on owner disconnect.
-- Test FTB Chunks/claims, graves, teams, tab list, sleeping, and chunk-ticket cost.
-- Decide whether offline workers justify a server/sidecar-hosted brain in phase two.
+Public Numen APIs expose `NumenTool.onServerCall`, but Numen 0.1.1 sends later
+synchronous task results only to the technical owner's client. A required Mixin on
+the exact pinned `TaskQueue.complete` captures result records whose call IDs use the
+private `mcp-zapeg-` prefix. Immediate perception results use the normal callback.
+Another pinned hook rejects client tool packets targeting managed UUIDs.
+
+These hooks are intentionally small and covered by dependency checksums. Upgrade
+Numen only after the Mixin application and an actual movement/mining loop are tested.
+The long-term fix is an upstream public server result-sink API.
+
+## Isolated smoke test before ATM9
+
+1. Build the addon and brain; start a throwaway Forge 47.4.10 server with exact Numen
+   0.1.1 and this jar.
+2. Start the brain with a mock provider. Verify `/healthz`, bearer rejection, a final
+   reply, a tool call/result continuation, max-step rejection, and cancellation.
+3. Start one client with Numen and the addon. No provider/key configuration should be
+   required in Numen's panel.
+4. Run `/citizen spawn Atlas Alice`; verify one body and one registry row.
+5. Repeat with `atlas`; verify no second case-colliding UUID is minted.
+6. Alice sends `@Atlas follow me for 20 blocks`; verify private routing and movement.
+7. Bob sends `@Atlas follow me`; verify private denial and no model request.
+8. Alice sends normal chat; verify it remains normal public chat.
+9. During a task, send `@Atlas stop`; verify the turn and physical task both stop.
+10. Try the stock Numen summon, cancel, and dismiss controls; verify they cannot
+    create or interfere with a managed citizen.
+11. Disconnect Alice; verify Atlas becomes dormant. Reconnect and verify UUID,
+    inventory, and position survive.
+12. Try dropped-item pickup, then low-risk mining with tools already supplied.
+13. Run `/citizen remove Atlas`; verify its inventory drops, body and roster entry
+    disappear, and the name can be reserved again.
+14. Repeat on a copied ZapeG/ATM9 world and test FTB Chunks claims before live rollout.
+
+The live server remains gated on this two-client and ATM9 smoke test. Do not point an
+experimental build at the production world data directory.

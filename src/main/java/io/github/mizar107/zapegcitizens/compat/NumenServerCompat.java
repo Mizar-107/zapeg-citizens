@@ -55,5 +55,62 @@ public final class NumenServerCompat {
         Companions.dormant(server, citizen);
     }
 
+    /**
+     * Permanently removes the exact managed body identity. A live body's inventory
+     * is dropped, matching Numen's normal confirmed-dismiss behavior.
+     */
+    public static DismissResult dismissManaged(
+            MinecraftServer server, java.util.UUID citizenId, java.util.UUID bodyOwnerId) {
+        OwnershipCheck ownership = checkManagedOwnership(server, citizenId, bodyOwnerId);
+        if (ownership == OwnershipCheck.MISMATCH) {
+            return DismissResult.OWNER_MISMATCH;
+        }
+        if (ownership == OwnershipCheck.MISSING) {
+            return DismissResult.MISSING;
+        }
+
+        NumenPlayer live = NumenPlayer.findByUuid(server, citizenId);
+        if (live != null) {
+            live.getInventory().dropAll();
+            Companions.dismiss(server, live);
+        } else {
+            CompanionRegistry registry = CompanionRegistry.get(server);
+            registry.remove(citizenId);
+        }
+
+        ServerPlayer bodyOwner = server.getPlayerList().getPlayer(bodyOwnerId);
+        if (bodyOwner != null && !(bodyOwner instanceof NumenPlayer)) {
+            Companions.syncRosterToOwner(server, bodyOwner);
+        }
+        return DismissResult.REMOVED;
+    }
+
+    /** Read-only identity check used before any cancellation or destructive removal. */
+    public static OwnershipCheck checkManagedOwnership(
+            MinecraftServer server, java.util.UUID citizenId, java.util.UUID bodyOwnerId) {
+        NumenPlayer live = NumenPlayer.findByUuid(server, citizenId);
+        CompanionRegistry.Entry entry = CompanionRegistry.get(server).find(citizenId);
+        if (live == null && entry == null) {
+            return OwnershipCheck.MISSING;
+        }
+        if ((live != null && !live.isOwnedByPlayer(bodyOwnerId))
+                || (entry != null && !entry.owner().equals(bodyOwnerId))) {
+            return OwnershipCheck.MISMATCH;
+        }
+        return OwnershipCheck.MATCH;
+    }
+
     public record RegisteredCompanion(java.util.UUID citizenId, String name, long diedAt) {}
+
+    public enum DismissResult {
+        REMOVED,
+        MISSING,
+        OWNER_MISMATCH
+    }
+
+    public enum OwnershipCheck {
+        MATCH,
+        MISSING,
+        MISMATCH
+    }
 }

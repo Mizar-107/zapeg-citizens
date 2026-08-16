@@ -1,0 +1,16 @@
+{
+  "required": true,
+  "minVersion": "0.8",
+  "package": "io.github.mizar107.zapegcitizens.mixin",
+  "compatibilityLevel": "JAVA_17",
+  "mixins": [
+    "ManagedCitizenCancelTasksPayloadMixin",
+    "ManagedCitizenDismissPayloadMixin",
+    "ManagedCitizenSummonPayloadMixin",
+    "ManagedCitizenToolPayloadMixin",
+    "TaskQueueResultMixin"
+  ],
+  "injectors": {
+    "defaultRequire": 1
+  }
+}
