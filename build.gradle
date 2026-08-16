@@ -26,6 +26,9 @@ minecraft {
             workingDirectory project.file('run')
             property 'forge.logging.markers', 'REGISTRIES'
             property 'forge.logging.console.level', 'debug'
+            // Exploded ForgeGradle source sets have no jar manifest, so register the
+            // required config through Mixin's supported development command line.
+            args '--mixin', 'zapeg_citizens.mixins.json'
             // The published Numen jar carries an SRG production refmap, while ForgeGradle's
             // userdev runtime uses official names. Numen's own 1.20.1 run configs use this
             // same dev-only switch; production must keep the refmap enabled.
@@ -156,7 +159,8 @@ tasks.named('jar', Jar).configure {
                 'Specification-Version' : '1',
                 'Implementation-Title'  : project.name,
                 'Implementation-Version': project.jar.archiveVersion,
-                'Implementation-Vendor' : mod_authors
+                'Implementation-Vendor' : mod_authors,
+                'MixinConfigs'          : 'zapeg_citizens.mixins.json'
         ])
     }
     finalizedBy 'reobfJar'

@@ -4,9 +4,9 @@ import com.dwinovo.numen.entity.NumenPlayer;
 import com.mojang.brigadier.CommandDispatcher;
 import com.mojang.brigadier.arguments.StringArgumentType;
 import com.mojang.brigadier.exceptions.CommandSyntaxException;
+import io.github.mizar107.zapegcitizens.brain.CitizenBrainCoordinator;
 import io.github.mizar107.zapegcitizens.compat.NumenServerCompat;
 import io.github.mizar107.zapegcitizens.data.CitizenRegistryData;
-import io.github.mizar107.zapegcitizens.network.CitizenNetwork;
 import net.minecraft.commands.CommandSourceStack;
 import net.minecraft.commands.Commands;
 import net.minecraft.commands.arguments.EntityArgument;
@@ -32,7 +32,14 @@ public final class CitizenCommands {
                                                 StringArgumentType.getString(context, "name"),
                                                 EntityArgument.getPlayer(context, "player"))))))
                 .then(Commands.literal("list")
-                        .executes(context -> list(context.getSource()))));
+                        .executes(context -> list(context.getSource())))
+                .then(Commands.literal("remove")
+                        .then(Commands.argument("name", StringArgumentType.word())
+                                .executes(context -> remove(
+                                        context.getSource(),
+                                        StringArgumentType.getString(context, "name")))))
+                .then(Commands.literal("brain-status")
+                        .executes(context -> brainStatus(context.getSource()))));
     }
 
     private static int spawn(CommandSourceStack source, String requestedName, ServerPlayer owner)
@@ -55,7 +62,7 @@ public final class CitizenCommands {
                 registry.findByName(validatedName);
         if (reservation.isPresent()) {
             CitizenRegistryData.CitizenRecord record = reservation.orElseThrow();
-            if (!record.ownerId().equals(owner.getUUID())) {
+            if (!record.logicalOwner().matchesPlayer(owner.getUUID())) {
                 source.sendFailure(Component.literal(
                         "The citizen name '" + record.name() + "' is already reserved."));
                 return 0;
@@ -69,7 +76,6 @@ public final class CitizenCommands {
                 return 0;
             }
 
-            CitizenNetwork.sendReady(owner, live.getUUID(), record.name());
             source.sendSuccess(() -> Component.literal(
                     "Citizen '" + record.name() + "' is already active for "
                             + owner.getGameProfile().getName() + " (" + live.getUUID() + ")."), true);
@@ -96,14 +102,14 @@ public final class CitizenCommands {
         }
 
         NumenPlayer citizen = NumenServerCompat.spawnFor(owner, name);
-        registry.reserve(name, citizen.getUUID(), owner.getUUID());
-        CitizenNetwork.sendReady(owner, citizen.getUUID(), name);
+        registry.reservePlayer(name, citizen.getUUID(), owner.getUUID());
 
         source.sendSuccess(() -> Component.literal(
                 "Spawned citizen '" + name + "' for " + owner.getGameProfile().getName()
                         + " (" + citizen.getUUID() + ")."), true);
         owner.sendSystemMessage(Component.literal(
-                "[Citizens] " + name + " is yours. Give work with @" + name + " <task>."));
+                "[Citizens] " + name + " is yours. Give work with @" + name
+                        + " <task>; use @" + name + " stop to cancel."));
         return 1;
     }
 
@@ -111,9 +117,13 @@ public final class CitizenCommands {
         List<String> rows = new ArrayList<>();
         for (CitizenRegistryData.CitizenRecord record
                 : CitizenRegistryData.get(source.getServer()).all()) {
-            ServerPlayer owner = source.getServer().getPlayerList().getPlayer(record.ownerId());
+            java.util.Optional<java.util.UUID> ownerId = record.logicalOwner().playerId();
+            ServerPlayer owner = ownerId
+                    .map(id -> source.getServer().getPlayerList().getPlayer(id))
+                    .orElse(null);
             String ownerName = owner == null
-                    ? record.ownerId().toString()
+                    ? record.logicalOwner().kind().name().toLowerCase(java.util.Locale.ROOT)
+                            + ":" + record.logicalOwner().id()
                     : owner.getGameProfile().getName();
             boolean live = NumenPlayer.findByUuid(source.getServer(), record.citizenId()) != null;
             rows.add(record.name() + " -> " + ownerName + " [" + (live ? "live" : "dormant")
@@ -123,7 +133,59 @@ public final class CitizenCommands {
             source.sendSuccess(() -> Component.literal("No managed citizens."), false);
             return 0;
         }
-        source.sendSuccess(() -> Component.literal("Live citizens: " + String.join(", ", rows)), false);
+        source.sendSuccess(() -> Component.literal(
+                "Managed citizens: " + String.join(", ", rows)), false);
         return rows.size();
+    }
+
+    private static int remove(CommandSourceStack source, String requestedName) {
+        CitizenRegistryData registry = CitizenRegistryData.get(source.getServer());
+        CitizenRegistryData.CitizenRecord record = registry.findByName(requestedName)
+                .orElse(null);
+        if (record == null) {
+            source.sendFailure(Component.literal(
+                    "No managed citizen named '" + requestedName + "'."));
+            return 0;
+        }
+
+        NumenServerCompat.OwnershipCheck ownership = NumenServerCompat.checkManagedOwnership(
+                source.getServer(), record.citizenId(), record.bodyOwnerId());
+        if (ownership == NumenServerCompat.OwnershipCheck.MISMATCH) {
+            CitizenBrainCoordinator.instance().stopForOwnershipMismatch(record.citizenId());
+            source.sendFailure(Component.literal(
+                    "Refused to remove '" + record.name()
+                            + "': its Numen body-owner identity does not match the managed registry."));
+            return 0;
+        }
+
+        CitizenBrainCoordinator.instance().stopForRemoval(source.getServer(), record.citizenId());
+        NumenServerCompat.DismissResult result = NumenServerCompat.dismissManaged(
+                source.getServer(), record.citizenId(), record.bodyOwnerId());
+        if (result == NumenServerCompat.DismissResult.OWNER_MISMATCH) {
+            source.sendFailure(Component.literal(
+                    "Refused to remove '" + record.name()
+                            + "': its Numen body-owner identity does not match the managed registry."));
+            return 0;
+        }
+        if (!registry.remove(record)) {
+            source.sendFailure(Component.literal(
+                    "Citizen body removal finished, but its managed reservation changed; "
+                            + "inspect the server log before retrying."));
+            return 0;
+        }
+
+        source.sendSuccess(() -> Component.literal(
+                "Removed citizen '" + record.name() + "' ("
+                        + (result == NumenServerCompat.DismissResult.REMOVED
+                                ? "body/registry removed"
+                                : "stale reservation cleared")
+                        + ")."), true);
+        return 1;
+    }
+
+    private static int brainStatus(CommandSourceStack source) {
+        source.sendSuccess(() -> Component.literal(
+                CitizenBrainCoordinator.instance().statusSummary()), false);
+        return CitizenBrainCoordinator.instance().isEnabled() ? 1 : 0;
     }
 }
