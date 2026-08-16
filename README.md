@@ -24,8 +24,8 @@ Alice gives Atlas a private natural-language task in ordinary chat:
 
 The addressed message is removed from public chat. The server verifies the managed
 citizen and logical owner, sends the turn to the private brain service, and executes
-only server-allowlisted Numen tools against Atlas's exact UUID. To cancel both the
-LLM turn and physical work:
+the explicitly registered server-capable Numen tools against Atlas's exact UUID.
+To cancel both the LLM turn and physical work:
 
 ```text
 @Atlas stop
@@ -59,8 +59,10 @@ client pack.
   and turn lifetime.
 - Tool names and arguments are model output, not authority. The Forge mod resolves
   an explicit allowlist and Numen validates typed arguments again.
-- The initial worker policy excludes combat, building, item dropping/transfers,
-  arbitrary container interaction, and Numen's client-only tools.
+- The worker policy exposes all 32 Numen 0.1.1 tools that can run through the
+  dedicated-server bridge, including building, combat, item transfers, blueprints,
+  and container interaction. Numen's `todowrite` and `load_skill` remain excluded
+  because they are client-only helpers with no dedicated-server execution context.
 - `@Name stop`, logout, bridge failure, and server shutdown cancel pending result
   routes and Numen body work.
 - Pinned Mixin hooks capture completed Numen tasks for the host brain, reject
@@ -97,9 +99,11 @@ data model again.
 Stock Numen summon/despawn commands and G-panel summoning are gated; operators use
 the managed spawn/remove commands instead. Adoption/reconciliation of companions
 created before this addon, true server-owned spawning, offline chunk lifecycle,
-home-based death recovery, faction-safe combat, and full ATM9 validation remain
-follow-up work. Common enemies and boss combat should use deterministic mob/state
-machine AI; see [lore NPC guidance](docs/lore-npcs.md).
+home-based death recovery, faction/ally-aware combat validation, and full ATM9
+validation remain follow-up work. Raw Numen combat is available to managed citizens;
+the addon does not yet add faction or friendly-fire rules around it. Common enemies
+and boss combat should use deterministic mob/state machine AI; see
+[lore NPC guidance](docs/lore-npcs.md).
 
 ## Build and test
 

@@ -4,11 +4,12 @@ import java.util.List;
 import java.util.Set;
 
 /**
- * Fail-closed capability policy for the shared worker brain.
+ * Explicit server-capable Numen tool policy for the shared worker brain.
  *
- * <p>These are the exact tool names exported by pinned Numen 0.1.1. Keep this
- * list explicit: newly installed or newly added Numen tools must never become
- * available to a remote model merely because they appeared in ToolRegistry.
+ * <p>These are all 32 server-capable tool names exported by pinned Numen 0.1.1.
+ * Keep this list explicit so a Numen upgrade cannot silently expose a new tool.
+ * The remaining registered tools, {@code todowrite} and {@code load_skill}, are
+ * client-only helpers and cannot execute through the dedicated-server bridge.
  */
 public final class WorkerToolPolicy {
 
@@ -29,7 +30,22 @@ public final class WorkerToolPolicy {
             "fish",
             "equip_item",
             "eat_item",
-            "craft"
+            "craft",
+            "build",
+            "blueprint",
+            "blueprint_read",
+            "interact_at",
+            "interact_entity",
+            "melee_attack",
+            "ranged_attack",
+            "task_status",
+            "task_stop",
+            "drop_items",
+            "take_items",
+            "inspect_gui",
+            "transfer",
+            "close_gui",
+            "inspect_block_storage"
     );
 
     private static final Set<String> NAMES = Set.copyOf(ORDERED_NAMES);

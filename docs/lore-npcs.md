@@ -28,7 +28,8 @@ safe across restarts and deaths.
 Numen's melee and ranged actuators have real pathfinding, cooldown, aiming, and
 retreat behavior, so a future guard can be useful. They currently accept raw entity
 targets, lack faction/friendly-fire policy, and can inherit navigation that breaks or
-places blocks. Combat tools are therefore excluded from the worker profile.
+places blocks. The unrestricted player-worker profile exposes these raw combat tools;
+future server-owned guards still need deterministic faction and target selection.
 
 Real-time boss actions must never wait for a model response. A server state machine
 keeps the fight responsive and fair when Ollama is slow or unavailable; the LLM can

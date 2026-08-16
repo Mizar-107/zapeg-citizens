@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+from copy import deepcopy
 import unittest
 
 from citizen_brain.provider import ProviderReply, ProviderToolCall
@@ -179,6 +180,37 @@ class BrainServiceTest(TempDatabaseTest, unittest.TestCase):
         result = service.start(start_payload())
         self.assertEqual("final", result["kind"])
         self.assertIn("tool-step limit", result["speech"])
+
+    def test_numen_build_sized_tool_description_is_accepted_and_forwarded(self) -> None:
+        description = "Build operation details. " + ("x" * 2_869)
+        self.assertEqual(2_894, len(description))
+        payload = deepcopy(start_payload("numen-build-description"))
+        payload["tools"][0]["function"]["description"] = description
+        provider = FakeProvider(final_reply("Ready to build."))
+
+        result = self.service(provider).start(payload)
+
+        self.assertEqual("Ready to build.", result["speech"])
+        self.assertEqual(description, provider.calls[0][1][0]["function"]["description"])
+
+    def test_tool_description_limit_rejects_oversize_and_can_be_raised(self) -> None:
+        payload = deepcopy(start_payload("oversized-tool-description"))
+        payload["tools"][0]["function"]["description"] = "x" * 4_097
+        provider = FakeProvider(final_reply("Must not run."))
+
+        with self.assertRaises(ApiError) as raised:
+            self.service(provider).start(payload)
+        self.assertEqual(413, raised.exception.status)
+        self.assertEqual("tool_description_too_large", raised.exception.code)
+        self.assertEqual([], provider.calls)
+
+        payload["request_id"] = "raised-tool-description-limit"
+        allowed_provider = FakeProvider(final_reply("Long schema accepted."))
+        result = self.service(
+            allowed_provider,
+            CITIZENS_MAX_TOOL_DESCRIPTION_CHARS="8192",
+        ).start(payload)
+        self.assertEqual("Long schema accepted.", result["speech"])
 
     def test_unknown_provider_tool_is_rejected_and_turn_is_released(self) -> None:
         provider = FakeProvider(

@@ -68,6 +68,7 @@ class Settings:
     max_prompt_chars: int
     max_result_chars: int
     max_speech_chars: int
+    max_tool_description_chars: int
     max_tool_schema_bytes: int
     max_tools: int
     max_tool_steps: int
@@ -115,6 +116,9 @@ class Settings:
             max_prompt_chars=_integer(values, "CITIZENS_MAX_PROMPT_CHARS", 8_000, 1, 64_000),
             max_result_chars=_integer(values, "CITIZENS_MAX_RESULT_CHARS", 16_000, 1, 128_000),
             max_speech_chars=_integer(values, "CITIZENS_MAX_SPEECH_CHARS", 2_048, 1, 2_048),
+            max_tool_description_chars=_integer(
+                values, "CITIZENS_MAX_TOOL_DESCRIPTION_CHARS", 4_096, 1, 65_536
+            ),
             max_tool_schema_bytes=_integer(
                 values, "CITIZENS_MAX_TOOL_SCHEMA_BYTES", 131_072, 1_024, 1_048_576
             ),

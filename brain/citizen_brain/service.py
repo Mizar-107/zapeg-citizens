@@ -348,8 +348,14 @@ class BrainService:
                 raise ApiError(400, "invalid_request", f"duplicate tool name: {name}")
             seen.add(name)
             description = function.get("description", "")
-            if not isinstance(description, str) or len(description) > 2_000:
+            if not isinstance(description, str):
                 raise ApiError(400, "invalid_request", f"tools[{index}] has an invalid description")
+            if len(description) > self.settings.max_tool_description_chars:
+                raise ApiError(
+                    413,
+                    "tool_description_too_large",
+                    f"tools[{index}] description exceeds the configured limit",
+                )
             parameters = function.get("parameters", {"type": "object", "properties": {}})
             if not isinstance(parameters, dict):
                 raise ApiError(400, "invalid_request", f"tools[{index}] parameters must be an object")
