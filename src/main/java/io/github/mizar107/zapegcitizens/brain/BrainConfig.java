@@ -15,7 +15,10 @@ public record BrainConfig(
         Duration connectTimeout,
         Duration requestTimeout,
         Duration turnTimeout,
-        int maxToolSteps) {
+        int maxToolSteps,
+        int maxJobActions,
+        int maxJobModelCalls,
+        Duration maxJobActiveTime) {
 
     private static final String URL_ENV = "CITIZENS_BRAIN_URL";
     private static final String TOKEN_ENV = "CITIZENS_BRAIN_TOKEN";
@@ -27,6 +30,7 @@ public record BrainConfig(
         Objects.requireNonNull(connectTimeout, "connectTimeout");
         Objects.requireNonNull(requestTimeout, "requestTimeout");
         Objects.requireNonNull(turnTimeout, "turnTimeout");
+        Objects.requireNonNull(maxJobActiveTime, "maxJobActiveTime");
         if (token.isBlank()) {
             throw new IllegalStateException("The shared brain bearer token must not be blank");
         }
@@ -36,6 +40,39 @@ public record BrainConfig(
                         "The shared brain bearer token must not contain control characters");
             }
         }
+        if (maxToolSteps < 1 || maxToolSteps > 64) {
+            throw new IllegalStateException("maxToolSteps must be between 1 and 64");
+        }
+        if (maxJobActions < 1 || maxJobActions > 4_096) {
+            throw new IllegalStateException("maxJobActions must be between 1 and 4096");
+        }
+        if (maxJobModelCalls < 1 || maxJobModelCalls > 8_192) {
+            throw new IllegalStateException("maxJobModelCalls must be between 1 and 8192");
+        }
+        if (maxJobActiveTime.compareTo(Duration.ofSeconds(30)) < 0
+                || maxJobActiveTime.compareTo(Duration.ofDays(30)) > 0) {
+            throw new IllegalStateException("maxJobActiveTime must be between 30 seconds and 30 days");
+        }
+    }
+
+    /** Source-compatible constructor retained for the dialogue-only tests and callers. */
+    public BrainConfig(
+            URI baseUri,
+            String token,
+            Duration connectTimeout,
+            Duration requestTimeout,
+            Duration turnTimeout,
+            int maxToolSteps) {
+        this(
+                baseUri,
+                token,
+                connectTimeout,
+                requestTimeout,
+                turnTimeout,
+                maxToolSteps,
+                128,
+                192,
+                Duration.ofHours(3));
     }
 
     public static Optional<BrainConfig> fromEnvironment() {
@@ -76,7 +113,11 @@ public record BrainConfig(
                 Duration.ofMillis(boundedInt("CITIZENS_BRAIN_CONNECT_TIMEOUT_MS", 3_000, 250, 30_000)),
                 Duration.ofMillis(boundedInt("CITIZENS_BRAIN_REQUEST_TIMEOUT_MS", 150_000, 1_000, 600_000)),
                 Duration.ofMillis(boundedInt("CITIZENS_BRAIN_TURN_TIMEOUT_MS", 600_000, 30_000, 86_400_000)),
-                boundedInt("CITIZENS_BRAIN_MAX_TOOL_STEPS", 16, 1, 64)));
+                boundedInt("CITIZENS_BRAIN_MAX_TOOL_STEPS", 16, 1, 64),
+                boundedInt("CITIZENS_JOB_MAX_ACTIONS", 128, 1, 4_096),
+                boundedInt("CITIZENS_JOB_MAX_MODEL_CALLS", 192, 1, 8_192),
+                Duration.ofSeconds(boundedInt(
+                        "CITIZENS_JOB_MAX_ACTIVE_SECONDS", 10_800, 30, 2_592_000))));
     }
 
     URI endpoint(String path) {

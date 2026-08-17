@@ -64,7 +64,7 @@ class SQLiteMigrationTest(TempDatabaseTest, unittest.TestCase):
         self.assertEqual("failed", states["turn-new"])
         self.assertNotIn("one_active_turn_per_session", indexes)
         self.assertIn("one_active_turn_per_citizen", indexes)
-        self.assertEqual(3, version)
+        self.assertEqual(4, version)
 
     def test_reopen_fails_calling_turn_but_preserves_waiting_tool_turn(self) -> None:
         SQLiteStore(self.db_path)

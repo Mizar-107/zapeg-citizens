@@ -5,13 +5,15 @@ import com.mojang.brigadier.CommandDispatcher;
 import com.mojang.brigadier.arguments.StringArgumentType;
 import com.mojang.brigadier.exceptions.CommandSyntaxException;
 import io.github.mizar107.zapegcitizens.brain.CitizenBrainCoordinator;
-import io.github.mizar107.zapegcitizens.brain.CitizenBrainCoordinator.InteractionMode;
+import io.github.mizar107.zapegcitizens.brain.CitizenJobManager;
+import io.github.mizar107.zapegcitizens.brain.CitizenJobManager.JobOperation;
 import io.github.mizar107.zapegcitizens.compat.NumenServerCompat;
 import io.github.mizar107.zapegcitizens.data.CitizenRegistryData;
 import io.github.mizar107.zapegcitizens.data.CitizenRegistryData.CitizenProfile;
 import io.github.mizar107.zapegcitizens.data.CitizenRegistryData.CitizenRecord;
 import io.github.mizar107.zapegcitizens.data.CitizenRegistryData.HomeAnchor;
 import io.github.mizar107.zapegcitizens.data.CitizenRegistryData.OwnerKind;
+import io.github.mizar107.zapegcitizens.data.CitizenJobData.JobRecord;
 import io.github.mizar107.zapegcitizens.lifecycle.ServerCitizenLifecycleManager;
 import io.github.mizar107.zapegcitizens.lifecycle.ServerCitizenLifecycleManager.LifecycleResult;
 import net.minecraft.commands.CommandSourceStack;
@@ -24,6 +26,7 @@ import net.minecraft.world.phys.Vec2;
 import net.minecraft.world.phys.Vec3;
 
 import java.util.ArrayList;
+import java.util.Comparator;
 import java.util.List;
 import java.util.Locale;
 import java.util.Optional;
@@ -112,6 +115,30 @@ public final class CitizenCommands {
                                 .executes(context -> stop(
                                         context.getSource(),
                                         StringArgumentType.getString(context, "name")))))
+                .then(Commands.literal("status")
+                        .then(Commands.argument("name", StringArgumentType.word())
+                                .executes(context -> jobStatus(
+                                        context.getSource(),
+                                        StringArgumentType.getString(context, "name")))))
+                .then(Commands.literal("jobs")
+                        .executes(context -> jobs(context.getSource(), null))
+                        .then(Commands.argument("name", StringArgumentType.word())
+                                .executes(context -> jobs(
+                                        context.getSource(),
+                                        StringArgumentType.getString(context, "name")))))
+                .then(Commands.literal("resume")
+                        .then(Commands.argument("name", StringArgumentType.word())
+                                .executes(context -> resume(
+                                        context.getSource(),
+                                        StringArgumentType.getString(context, "name"),
+                                        ""))
+                                .then(Commands.argument(
+                                                "answer", StringArgumentType.greedyString())
+                                        .executes(context -> resume(
+                                                context.getSource(),
+                                                StringArgumentType.getString(context, "name"),
+                                                StringArgumentType.getString(
+                                                        context, "answer"))))))
                 .then(Commands.literal("wake")
                         .then(Commands.argument("name", StringArgumentType.word())
                                 .executes(context -> wake(
@@ -365,12 +392,17 @@ public final class CitizenCommands {
             return 0;
         }
 
-        return CitizenBrainCoordinator.instance().submit(
-                actor, record, body, prompt, InteractionMode.TASK) ? 1 : 0;
+        JobOperation operation = CitizenJobManager.instance().submit(
+                actor, record, body, prompt);
+        if (!operation.successful()) {
+            source.sendFailure(Component.literal(operation.message()));
+            return 0;
+        }
+        return 1;
     }
 
     private static int stop(CommandSourceStack source, String requestedName) {
-        CitizenRecord record = requireServerCitizen(source, requestedName);
+        CitizenRecord record = requireCitizen(source, requestedName);
         if (record == null) {
             return 0;
         }
@@ -378,6 +410,9 @@ public final class CitizenCommands {
         NumenServerCompat.OwnershipCheck ownership = NumenServerCompat.checkManagedOwnership(
                 source.getServer(), record.citizenId(), record.bodyOwnerId());
         if (ownership == NumenServerCompat.OwnershipCheck.MISMATCH) {
+            CitizenJobManager.instance().ownershipMismatch(
+                    source.getServer(), record.citizenId(),
+                    "managed body-owner identity is inconsistent");
             CitizenBrainCoordinator.instance().stopForOwnershipMismatch(record.citizenId());
             source.sendFailure(Component.literal(
                     "Refused to stop '" + record.name()
@@ -385,13 +420,83 @@ public final class CitizenCommands {
             return 0;
         }
 
-        // This path works while a correctly registered body is dead or dormant. It only clears
-        // logical/physical work; the separate remove command owns permanent deletion.
-        CitizenBrainCoordinator.instance().stopForRemoval(
-                source.getServer(), record);
+        JobOperation operation = CitizenJobManager.instance().cancel(
+                source.getServer(), record, "canceled by an operator");
+        boolean dialogueStopped = CitizenBrainCoordinator.instance()
+                .stopForRemoval(source.getServer(), record);
+        if (!operation.successful() && !dialogueStopped) {
+            source.sendFailure(Component.literal(operation.message()));
+            return 0;
+        }
+        String message = operation.successful()
+                ? operation.message()
+                : "Stopped the active dialogue for " + record.name() + ".";
+        source.sendSuccess(() -> Component.literal(message), true);
+        return 1;
+    }
+
+    private static int jobStatus(CommandSourceStack source, String requestedName) {
+        CitizenRecord record = requireCitizen(source, requestedName);
+        if (record == null) {
+            return 0;
+        }
+        JobRecord job = CitizenJobManager.instance()
+                .status(source.getServer(), record.citizenId())
+                .orElse(null);
+        if (job == null) {
+            source.sendSuccess(() -> Component.literal(
+                    "Citizen '" + record.name() + "' has no active job."), false);
+            return 0;
+        }
         source.sendSuccess(() -> Component.literal(
-                "Stopped server citizen '" + record.name()
-                        + "' and cleared its current work."), true);
+                record.name() + ": " + CitizenJobManager.instance().formatStatus(job)), false);
+        return 1;
+    }
+
+    private static int jobs(CommandSourceStack source, String requestedName) {
+        List<JobRecord> jobs;
+        String heading;
+        if (requestedName == null) {
+            jobs = CitizenRegistryData.get(source.getServer()).all().stream()
+                    .flatMap(record -> CitizenJobManager.instance()
+                            .history(source.getServer(), record.citizenId()).stream())
+                    .toList();
+            heading = "Citizen jobs";
+        } else {
+            CitizenRecord record = requireCitizen(source, requestedName);
+            if (record == null) {
+                return 0;
+            }
+            jobs = CitizenJobManager.instance().history(source.getServer(), record.citizenId());
+            heading = record.name() + " jobs";
+        }
+        if (jobs.isEmpty()) {
+            source.sendSuccess(() -> Component.literal(heading + ": none."), false);
+            return 0;
+        }
+        List<String> rows = jobs.stream()
+                .sorted(Comparator.comparingLong(JobRecord::updatedGameTime).reversed())
+                .limit(10)
+                .map(CitizenJobManager.instance()::formatStatus)
+                .toList();
+        source.sendSuccess(() -> Component.literal(
+                heading + ":\n - " + String.join("\n - ", rows)), false);
+        return rows.size();
+    }
+
+    private static int resume(
+            CommandSourceStack source, String requestedName, String answer) {
+        CitizenRecord record = requireCitizen(source, requestedName);
+        if (record == null) {
+            return 0;
+        }
+        JobOperation operation = CitizenJobManager.instance().resume(
+                source.getServer(), record, answer);
+        if (!operation.successful()) {
+            source.sendFailure(Component.literal(operation.message()));
+            return 0;
+        }
+        source.sendSuccess(() -> Component.literal(operation.message()), true);
         return 1;
     }
 
@@ -488,6 +593,9 @@ public final class CitizenCommands {
         NumenServerCompat.OwnershipCheck ownership = NumenServerCompat.checkManagedOwnership(
                 source.getServer(), record.citizenId(), record.bodyOwnerId());
         if (ownership == NumenServerCompat.OwnershipCheck.MISMATCH) {
+            CitizenJobManager.instance().ownershipMismatch(
+                    source.getServer(), record.citizenId(),
+                    "managed body-owner identity is inconsistent");
             CitizenBrainCoordinator.instance().stopForOwnershipMismatch(record.citizenId());
             source.sendFailure(Component.literal(
                     "Refused to remove '" + record.name()
@@ -495,6 +603,8 @@ public final class CitizenCommands {
             return 0;
         }
 
+        CitizenJobManager.instance().cancel(
+                source.getServer(), record, "citizen removed by an operator");
         CitizenBrainCoordinator.instance().stopForRemoval(source.getServer(), record);
         NumenServerCompat.DismissResult result = NumenServerCompat.dismissManaged(
                 source.getServer(), record.citizenId(), record.bodyOwnerId());
@@ -525,8 +635,25 @@ public final class CitizenCommands {
 
     private static int brainStatus(CommandSourceStack source) {
         source.sendSuccess(() -> Component.literal(
-                CitizenBrainCoordinator.instance().statusSummary()), false);
-        return CitizenBrainCoordinator.instance().isEnabled() ? 1 : 0;
+                CitizenBrainCoordinator.instance().statusSummary()
+                        + " Durable jobs: "
+                        + (CitizenJobManager.instance().isEnabled() ? "enabled" : "disabled")
+                        + ", " + CitizenJobManager.instance().inFlightCount()
+                        + " HTTP operation(s) in flight."), false);
+        return CitizenBrainCoordinator.instance().isEnabled()
+                && CitizenJobManager.instance().isEnabled() ? 1 : 0;
+    }
+
+    private static CitizenRecord requireCitizen(
+            CommandSourceStack source, String requestedName) {
+        CitizenRecord record = CitizenRegistryData.get(source.getServer())
+                .findByName(requestedName.strip())
+                .orElse(null);
+        if (record == null) {
+            source.sendFailure(Component.literal(
+                    "No managed citizen named '" + requestedName + "'."));
+        }
+        return record;
     }
 
     private static CitizenRecord requireServerCitizen(

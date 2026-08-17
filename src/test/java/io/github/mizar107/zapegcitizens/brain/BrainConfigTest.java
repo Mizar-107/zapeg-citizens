@@ -16,7 +16,10 @@ class BrainConfigTest {
             "CITIZENS_BRAIN_CONNECT_TIMEOUT_MS",
             "CITIZENS_BRAIN_REQUEST_TIMEOUT_MS",
             "CITIZENS_BRAIN_TURN_TIMEOUT_MS",
-            "CITIZENS_BRAIN_MAX_TOOL_STEPS"
+            "CITIZENS_BRAIN_MAX_TOOL_STEPS",
+            "CITIZENS_JOB_MAX_ACTIONS",
+            "CITIZENS_JOB_MAX_MODEL_CALLS",
+            "CITIZENS_JOB_MAX_ACTIVE_SECONDS"
     };
 
     @AfterEach
@@ -38,12 +41,18 @@ class BrainConfigTest {
         System.setProperty("CITIZENS_BRAIN_TOKEN", "bridge-secret");
         System.setProperty("CITIZENS_BRAIN_MAX_TOOL_STEPS", "7");
         System.setProperty("CITIZENS_BRAIN_TURN_TIMEOUT_MS", "45000");
+        System.setProperty("CITIZENS_JOB_MAX_ACTIONS", "144");
+        System.setProperty("CITIZENS_JOB_MAX_MODEL_CALLS", "233");
+        System.setProperty("CITIZENS_JOB_MAX_ACTIVE_SECONDS", "7200");
 
         BrainConfig config = BrainConfig.fromEnvironment().orElseThrow();
 
         assertEquals("http://citizen-brain:8787", config.baseUri().toString());
         assertEquals(7, config.maxToolSteps());
         assertEquals(45_000, config.turnTimeout().toMillis());
+        assertEquals(144, config.maxJobActions());
+        assertEquals(233, config.maxJobModelCalls());
+        assertEquals(7_200, config.maxJobActiveTime().toSeconds());
         assertEquals("http://citizen-brain:8787/v1/turn/start",
                 config.endpoint("/v1/turn/start").toString());
     }

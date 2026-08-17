@@ -16,18 +16,20 @@ An operator assigns a named citizen to an online player:
 /citizen spawn Atlas Alice
 ```
 
-Alice gives Atlas a private natural-language task in ordinary chat:
+Alice gives Atlas a private natural-language job in ordinary chat:
 
 ```text
 @Atlas go collect iron
 ```
 
 The addressed message is removed from public chat. The server verifies the managed
-citizen and logical owner, sends the turn to the private brain service, and executes
-the explicitly registered server-capable Numen tools against Atlas's exact UUID.
-To cancel both the LLM turn and physical work:
+citizen and logical owner, records a durable job and its player-authenticated location
+and looked-at block, then executes one persisted Numen action at a time against Atlas's
+exact UUID. Long work can plan, checkpoint, pause, resume, and recover without blindly
+repeating an uncertain world mutation. To inspect or cancel it:
 
 ```text
+@Atlas status
 @Atlas stop
 ```
 
@@ -47,9 +49,10 @@ An operator can create a citizen that belongs to the world rather than a player:
 Any player can then speak to Edda in ordinary public chat with `@Edda <message>`.
 The addressed message remains public, the reply is broadcast as `[Edda] ...`, and
 conversation memory stays isolated per player. Public lore dialogue receives no
-world tools. An in-game operator can deliberately assign physical work—with all 32
-server-capable Numen tools—using `/citizen task Edda <task>`, and cancel it with
-`/citizen stop Edda`.
+world tools. An in-game operator can deliberately assign a durable physical job—with
+all 32 server-capable Numen tools plus Citizens' trusted workflow loader—using
+`/citizen task Edda <goal>`. Operators can inspect, resume, or cancel it with
+`/citizen status Edda`, `/citizen resume Edda [answer]`, and `/citizen stop Edda`.
 
 Server citizens have a persistent persona, role, faction, technical owner, and home
 anchor. `/citizen persona Edda <text>` changes the profile for future turns;
@@ -73,22 +76,26 @@ development, but production then depends on that computer and requires a secured
 VPN/tunnel. Never expose Ollama's local API or the brain port directly to the public
 internet.
 
-See [deployment](docs/deployment.md) for the exact split between host, server, and
-client pack.
+See [complex jobs](docs/complex-jobs.md) for the job model and current capability
+limits, and [deployment](docs/deployment.md) for the exact split between host,
+server, and client pack.
 
 ## Safety boundary
 
-- One active turn per citizen; the mod applies a ten-minute overall watchdog, and
-  the sidecar also bounds global model concurrency, prompt/body sizes, tool steps,
-  and turn lifetime.
+- Dialogue has one bounded turn per citizen and a ten-minute watchdog. Physical work
+  has one durable job per citizen, persisted action IDs and checkpoints, and separate
+  action/model/active-time budgets (128 actions, 192 model calls, and three active
+  hours by default). Paused time does not consume the active-time budget.
 - Tool names and arguments are model output, not authority. The Forge mod resolves
   an explicit allowlist and Numen validates typed arguments again.
 - The worker policy exposes all 32 Numen 0.1.1 tools that can run through the
   dedicated-server bridge, including building, combat, item transfers, blueprints,
-  and container interaction. Numen's `todowrite` and `load_skill` remain excluded
-  because they are client-only helpers with no dedicated-server execution context.
-- Player `@Name stop`, operator `/citizen stop Name`, logout, bridge failure, and
-  server shutdown cancel pending result routes and Numen body work.
+  and container interaction. Numen's client-local `todowrite` and `load_skill`
+  implementations remain excluded. Citizens adds a path-free, server-owned
+  `load_skill` with four trusted workflows: storage, building, mining, and combat.
+- Player `@Name stop` and operator `/citizen stop Name` cancel pending result routes
+  and Numen body work. Owner/body loss pauses player jobs; shutdown checkpoints every
+  active job; server-owned jobs do not depend on the submitting operator staying online.
 - Pinned Mixin hooks capture completed Numen tasks for the host brain, reject
   independent client tool/cancel/dismiss control of managed bodies, and block stock
   summons that could bypass global name reservations.
@@ -114,7 +121,9 @@ yet expose a server-side result sink.
 
 ## Current scope
 
-Player-owned workers and always-awake server-owned lore citizens are supported.
+Player-owned workers and always-awake server-owned lore citizens are supported,
+including durable multi-action physical jobs with status, pause/recovery, resumption,
+bounded history, and fail-closed reconciliation of persisted uncertain actions.
 Player workers become dormant when their owner logs out. Server citizens use a
 world-specific technical principal, keep their body ticket refreshed, snapshot
 their last position, hibernate during orderly shutdown, and wake or recover with

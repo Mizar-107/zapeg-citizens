@@ -84,7 +84,7 @@ def start_payload(
     prompt: str = "collect iron",
 ) -> dict[str, Any]:
     return {
-        "protocol": 2,
+        "protocol": 3,
         "request_id": request_id,
         "citizen": {
             "id": "citizen-1",

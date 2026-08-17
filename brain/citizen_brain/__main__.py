@@ -6,6 +6,7 @@ import logging
 
 from .config import Settings
 from .http_api import BrainApplication, create_server
+from .job_service import JobService
 from .provider import OllamaChatProvider
 from .service import BrainService
 from .storage import SQLiteStore
@@ -32,8 +33,10 @@ def main() -> None:
         concurrency=settings.llm_concurrency,
     )
     service = BrainService(settings=settings, store=store, provider=provider)
+    job_service = JobService(settings=settings, store=store, provider=provider)
     application = BrainApplication(
         service=service,
+        job_service=job_service,
         bearer_token=settings.brain_token,
         max_body_bytes=settings.max_body_bytes,
     )

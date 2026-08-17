@@ -9,6 +9,7 @@ import logging
 from typing import Any
 from urllib.parse import urlsplit
 
+from .job_service import JobService
 from .service import ApiError, BrainService, PROTOCOL_VERSION
 
 
@@ -16,8 +17,16 @@ LOGGER = logging.getLogger("citizen_brain.http")
 
 
 class BrainApplication:
-    def __init__(self, *, service: BrainService, bearer_token: str, max_body_bytes: int) -> None:
+    def __init__(
+        self,
+        *,
+        service: BrainService,
+        bearer_token: str,
+        max_body_bytes: int,
+        job_service: JobService | None = None,
+    ) -> None:
         self.service = service
+        self.job_service = job_service
         self.bearer_token = bearer_token
         self.max_body_bytes = max_body_bytes
 
@@ -53,6 +62,19 @@ class BrainRequestHandler(BaseHTTPRequestHandler):
             "/v1/turn/continue": self.server.application.service.continue_turn,
             "/v1/turn/cancel": self.server.application.service.cancel,
         }
+        jobs = self.server.application.job_service
+        if jobs is not None:
+            routes.update(
+                {
+                    "/v1/job/start": jobs.start,
+                    "/v1/job/result": jobs.result,
+                    "/v1/job/resume": jobs.resume,
+                    "/v1/job/pause": jobs.pause,
+                    "/v1/job/cancel": jobs.cancel,
+                    "/v1/job/status": jobs.status,
+                    "/v1/job/list": jobs.list_jobs,
+                }
+            )
         operation = routes.get(path)
         if operation is None:
             self._write_error(ApiError(404, "not_found", "route does not exist"))

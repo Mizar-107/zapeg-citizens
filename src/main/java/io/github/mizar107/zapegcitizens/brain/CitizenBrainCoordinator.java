@@ -68,7 +68,9 @@ public final class CitizenBrainCoordinator {
     public String statusSummary() {
         return http == null
                 ? "Shared brain: disabled (set CITIZENS_BRAIN_URL and token)."
-                : "Shared brain: configured; " + active.size() + " active turn(s).";
+                : "Shared brain: configured; " + active.size() + " active dialogue turn(s), "
+                        + CitizenJobManager.instance().inFlightCount()
+                        + " job request(s) in flight.";
     }
 
     public void health(ServerPlayer requester) {
@@ -96,6 +98,11 @@ public final class CitizenBrainCoordinator {
             NumenPlayer citizen,
             String prompt,
             InteractionMode mode) {
+        if (mode == InteractionMode.TASK) {
+            return CitizenJobManager.instance()
+                    .submit(actor, record, citizen, prompt)
+                    .successful();
+        }
         if (http == null) {
             tell(actor, "[Citizens] The shared brain is not configured. Ask the server host to start it.");
             return false;
@@ -160,6 +167,8 @@ public final class CitizenBrainCoordinator {
             ServerPlayer actor,
             CitizenRegistryData.CitizenRecord record,
             NumenPlayer citizen) {
+        CitizenJobManager.JobOperation jobStop = CitizenJobManager.instance().cancel(
+                actor.server, record, "canceled by " + actor.getGameProfile().getName());
         ActiveTurn turn = active.remove(record.citizenId());
         if (turn != null) {
             turn.cancelled = true;
@@ -170,15 +179,15 @@ public final class CitizenBrainCoordinator {
                 cancelRemote(turn);
             }
         }
-        NumenToolGateway.cancelBody(citizen);
         tell(actor, "[Citizens] Stopped " + record.name() + " and cleared its current work.");
         ZapeGCitizens.LOGGER.info(
-                "[citizen-audit] stopped actor={} citizen={} had_turn={}",
-                actor.getUUID(), record.citizenId(), turn != null);
-        return turn != null;
+                "[citizen-audit] stopped actor={} citizen={} had_turn={} had_job={}",
+                actor.getUUID(), record.citizenId(), turn != null, jobStop.successful());
+        return turn != null || jobStop.successful();
     }
 
     public void stopForLogout(MinecraftServer server, UUID ownerId) {
+        CitizenJobManager.instance().ownerUnavailable(server, ownerId);
         for (ActiveTurn turn : active.values()) {
             if (turn.actorId.equals(ownerId)
                     || turn.record.logicalOwner().matchesPlayer(ownerId)) {
@@ -189,6 +198,7 @@ public final class CitizenBrainCoordinator {
 
     /** Resolve a turn when Numen removes or kills its body without producing a task result. */
     public void bodyUnavailable(NumenPlayer citizen, String reason) {
+        CitizenJobManager.instance().bodyUnavailable(citizen, reason);
         ActiveTurn turn = active.remove(citizen.getUUID());
         if (turn == null) {
             return;
@@ -207,7 +217,7 @@ public final class CitizenBrainCoordinator {
     }
 
     /** Cancel any logical/physical work before an operator permanently removes a citizen. */
-    public void stopForRemoval(
+    public boolean stopForRemoval(
             MinecraftServer server, CitizenRegistryData.CitizenRecord record) {
         UUID citizenId = record.citizenId();
         ActiveTurn turn = active.get(citizenId);
@@ -216,13 +226,7 @@ public final class CitizenBrainCoordinator {
             tellActor(turn, "[Citizens] " + turn.record.name()
                     + " was stopped by an operator.");
         }
-        if (turn == null) {
-            NumenPlayer citizen = NumenServerCompat.findLiveManaged(
-                    server, citizenId, record.bodyOwnerId());
-            if (citizen != null) {
-                NumenToolGateway.cancelBody(citizen);
-            }
-        }
+        return turn != null;
     }
 
     /**
@@ -250,6 +254,7 @@ public final class CitizenBrainCoordinator {
 
     /** Server-tick watchdog for lost Numen callbacks or otherwise hung agent turns. */
     public void expireTimedOutTurns(MinecraftServer server) {
+        CitizenJobManager.instance().tick(server);
         if (config.isEmpty()) {
             return;
         }
@@ -263,6 +268,7 @@ public final class CitizenBrainCoordinator {
     }
 
     public void shutdown(MinecraftServer server) {
+        CitizenJobManager.instance().shutdown(server);
         for (ActiveTurn turn : active.values()) {
             cancelWithoutMessage(turn, "server stopping");
         }
@@ -376,11 +382,6 @@ public final class CitizenBrainCoordinator {
         if (turn.executionId != null) {
             NumenToolGateway.cancelExecution(turn.executionId);
         }
-        NumenPlayer citizen = NumenServerCompat.findLiveManaged(
-                turn.server, turn.citizenId, turn.record.bodyOwnerId());
-        if (citizen != null) {
-            NumenToolGateway.cancelBody(citizen);
-        }
         if (http != null) {
             cancelRemote(turn);
         }
@@ -397,11 +398,6 @@ public final class CitizenBrainCoordinator {
         turn.cancelled = true;
         if (turn.executionId != null) {
             NumenToolGateway.cancelExecution(turn.executionId);
-        }
-        NumenPlayer citizen = NumenServerCompat.findLiveManaged(
-                turn.server, turn.citizenId, turn.record.bodyOwnerId());
-        if (citizen != null) {
-            NumenToolGateway.cancelBody(citizen);
         }
         if (http != null) {
             cancelRemote(turn);

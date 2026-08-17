@@ -55,19 +55,19 @@ class BrainServiceTest(TempDatabaseTest, unittest.TestCase):
 
         second = service.continue_turn(
             {
-                "protocol": 2,
+                "protocol": 3,
                 "turn_id": first["turn_id"],
                 "tool_call_id": first["tool_call"]["id"],
                 "result": {"collected": 4},
             }
         )
         self.assertEqual("move_to", second["tool_call"]["name"])
-        self.assertEqual(2, second["protocol"])
+        self.assertEqual(3, second["protocol"])
         self.assertEqual(1, len(provider.calls), "queued call must not trigger the model early")
 
         final = service.continue_turn(
             {
-                "protocol": 2,
+                "protocol": 3,
                 "turn_id": first["turn_id"],
                 "tool_call_id": second["tool_call"]["id"],
                 "result": "arrived",
@@ -211,7 +211,7 @@ class BrainServiceTest(TempDatabaseTest, unittest.TestCase):
 
         self.assertEqual(400, raised.exception.status)
         self.assertEqual("unsupported_protocol", raised.exception.code)
-        self.assertEqual("protocol must be 2", raised.exception.message)
+        self.assertEqual("protocol must be 3", raised.exception.message)
         self.assertEqual([], provider.calls)
 
     def test_final_speech_control_whitespace_is_stored_and_returned_single_line(self) -> None:
@@ -250,7 +250,7 @@ class BrainServiceTest(TempDatabaseTest, unittest.TestCase):
         first = service.start(start_payload())
         service.continue_turn(
             {
-                "protocol": 2,
+                "protocol": 3,
                 "turn_id": first["turn_id"],
                 "tool_call_id": first["tool_call"]["id"],
                 "result": {"success": True},
@@ -337,13 +337,13 @@ class BrainServiceTest(TempDatabaseTest, unittest.TestCase):
         provider = FakeProvider(tool_reply(ProviderToolCall("move_to", {"x": 9})))
         service = self.service(provider)
         call = service.start(start_payload())
-        canceled = service.cancel({"protocol": 2, "turn_id": call["turn_id"]})
+        canceled = service.cancel({"protocol": 3, "turn_id": call["turn_id"]})
         self.assertEqual("canceled", canceled["kind"])
-        self.assertEqual(canceled, service.cancel({"protocol": 2, "turn_id": call["turn_id"]}))
+        self.assertEqual(canceled, service.cancel({"protocol": 3, "turn_id": call["turn_id"]}))
         with self.assertRaises(ApiError) as raised:
             service.continue_turn(
                 {
-                    "protocol": 2,
+                    "protocol": 3,
                     "turn_id": call["turn_id"],
                     "tool_call_id": call["tool_call"]["id"],
                     "result": "late",
@@ -369,19 +369,19 @@ class BrainServiceTest(TempDatabaseTest, unittest.TestCase):
         call = service.start(start_payload("lost-response-request"))
 
         canceled = service.cancel(
-            {"protocol": 2, "request_id": "lost-response-request"}
+            {"protocol": 3, "request_id": "lost-response-request"}
         )
         self.assertEqual("canceled", canceled["kind"])
         self.assertEqual(call["turn_id"], canceled["turn_id"])
         self.assertEqual(
             canceled,
-            service.cancel({"protocol": 2, "request_id": "lost-response-request"}),
+            service.cancel({"protocol": 3, "request_id": "lost-response-request"}),
         )
 
         with self.assertRaises(ApiError) as raised:
             service.cancel(
                 {
-                    "protocol": 2,
+                    "protocol": 3,
                     "turn_id": call["turn_id"],
                     "request_id": "lost-response-request",
                 }
@@ -393,14 +393,14 @@ class BrainServiceTest(TempDatabaseTest, unittest.TestCase):
         provider = FakeProvider(final_reply("Must never run."))
         service = self.service(provider)
 
-        early_cancel = service.cancel({"protocol": 2, "request_id": "raced-request"})
+        early_cancel = service.cancel({"protocol": 3, "request_id": "raced-request"})
         self.assertEqual(
-            {"protocol": 2, "turn_id": None, "kind": "canceled"},
+            {"protocol": 3, "turn_id": None, "kind": "canceled"},
             early_cancel,
         )
         self.assertEqual(
             early_cancel,
-            service.cancel({"protocol": 2, "request_id": "raced-request"}),
+            service.cancel({"protocol": 3, "request_id": "raced-request"}),
         )
 
         with self.assertRaises(ApiError) as raised:
@@ -421,7 +421,7 @@ class BrainServiceTest(TempDatabaseTest, unittest.TestCase):
         )
         for index in range(1, 4):
             now[0] = float(index)
-            service.cancel({"protocol": 2, "request_id": f"canceled-{index}"})
+            service.cancel({"protocol": 3, "request_id": f"canceled-{index}"})
 
         now[0] = 4.0
         allowed = service.start(start_payload("canceled-1"))
@@ -443,7 +443,7 @@ class BrainServiceTest(TempDatabaseTest, unittest.TestCase):
             provider=provider,
             clock=lambda: now[0],
         )
-        service.cancel({"protocol": 2, "request_id": "expired-cancellation"})
+        service.cancel({"protocol": 3, "request_id": "expired-cancellation"})
         now[0] = 71.0
         result = service.start(start_payload("expired-cancellation"))
         self.assertEqual("Cancellation expired.", result["speech"])

@@ -34,8 +34,14 @@ class SettingsTest(unittest.TestCase):
         self.assertEqual(2_048, configured.max_speech_chars)
         self.assertEqual(4_096, configured.max_tool_description_chars)
         self.assertEqual(4_096, configured.max_persona_chars)
+        self.assertEqual(262_144, configured.max_tool_argument_chars)
         self.assertEqual(86_400, configured.terminal_turn_ttl_seconds)
         self.assertEqual(1_000, configured.max_terminal_turns)
+        self.assertEqual(16, configured.max_active_jobs)
+        self.assertEqual(65_536, configured.max_job_context_chars)
+        self.assertEqual(16_384, configured.max_job_checkpoint_chars)
+        self.assertEqual(8, configured.max_job_recent_events)
+        self.assertEqual(8, configured.max_job_internal_steps)
 
     def test_direct_and_file_secret_cannot_both_be_set(self) -> None:
         with self.assertRaisesRegex(ValueError, "set only one"):
@@ -92,6 +98,27 @@ class SettingsTest(unittest.TestCase):
                     "CITIZENS_LLM_MODEL": "model",
                     "CITIZENS_BRAIN_TOKEN": "token",
                     "CITIZENS_MAX_PERSONA_CHARS": "16385",
+                }
+            )
+
+    def test_job_action_argument_limit_is_separate_and_bounded(self) -> None:
+        configured = Settings.from_env(
+            {
+                "CITIZENS_LLM_MODEL": "model",
+                "CITIZENS_BRAIN_TOKEN": "token",
+                "CITIZENS_MAX_RESULT_CHARS": "16000",
+                "CITIZENS_MAX_TOOL_ARGUMENT_CHARS": "524288",
+            }
+        )
+        self.assertEqual(16_000, configured.max_result_chars)
+        self.assertEqual(524_288, configured.max_tool_argument_chars)
+
+        with self.assertRaisesRegex(ValueError, "between 1024 and 1048576"):
+            Settings.from_env(
+                {
+                    "CITIZENS_LLM_MODEL": "model",
+                    "CITIZENS_BRAIN_TOKEN": "token",
+                    "CITIZENS_MAX_TOOL_ARGUMENT_CHARS": "1048577",
                 }
             )
 

@@ -14,7 +14,7 @@ from .provider import ChatProvider, ProviderError, ProviderReply
 from .storage import SQLiteStore, StoreError, TurnRecord
 
 
-PROTOCOL_VERSION = 2
+PROTOCOL_VERSION = 3
 _ID = re.compile(r"^[A-Za-z0-9][A-Za-z0-9_.:@-]{0,127}$")
 _TOOL_NAME = re.compile(r"^[A-Za-z_][A-Za-z0-9_.:-]{0,63}$")
 _LIMIT_SPEECH = "I stopped because this task reached the tool-step limit."
@@ -484,7 +484,7 @@ class BrainService:
     def _protocol(document: Mapping[str, Any]) -> None:
         value = document.get("protocol")
         if type(value) is not int or value != PROTOCOL_VERSION:
-            raise ApiError(400, "unsupported_protocol", "protocol must be 2")
+            raise ApiError(400, "unsupported_protocol", "protocol must be 3")
 
     @staticmethod
     def _identifier(value: Any, field: str) -> str:

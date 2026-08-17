@@ -68,6 +68,7 @@ class Settings:
     max_prompt_chars: int
     max_persona_chars: int
     max_result_chars: int
+    max_tool_argument_chars: int
     max_speech_chars: int
     max_tool_description_chars: int
     max_tool_schema_bytes: int
@@ -78,6 +79,11 @@ class Settings:
     turn_ttl_seconds: int
     terminal_turn_ttl_seconds: int
     max_terminal_turns: int
+    max_active_jobs: int
+    max_job_context_chars: int
+    max_job_checkpoint_chars: int
+    max_job_recent_events: int
+    max_job_internal_steps: int
 
     @classmethod
     def from_env(cls, env: Mapping[str, str] | None = None) -> "Settings":
@@ -119,6 +125,13 @@ class Settings:
                 values, "CITIZENS_MAX_PERSONA_CHARS", 4_096, 1, 16_384
             ),
             max_result_chars=_integer(values, "CITIZENS_MAX_RESULT_CHARS", 16_000, 1, 128_000),
+            max_tool_argument_chars=_integer(
+                values,
+                "CITIZENS_MAX_TOOL_ARGUMENT_CHARS",
+                262_144,
+                1_024,
+                1_048_576,
+            ),
             max_speech_chars=_integer(values, "CITIZENS_MAX_SPEECH_CHARS", 2_048, 1, 2_048),
             max_tool_description_chars=_integer(
                 values, "CITIZENS_MAX_TOOL_DESCRIPTION_CHARS", 4_096, 1, 65_536
@@ -138,5 +151,18 @@ class Settings:
             ),
             max_terminal_turns=_integer(
                 values, "CITIZENS_MAX_TERMINAL_TURNS", 1_000, 1, 100_000
+            ),
+            max_active_jobs=_integer(values, "CITIZENS_MAX_ACTIVE_JOBS", 16, 1, 1_024),
+            max_job_context_chars=_integer(
+                values, "CITIZENS_MAX_JOB_CONTEXT_CHARS", 65_536, 8_192, 262_144
+            ),
+            max_job_checkpoint_chars=_integer(
+                values, "CITIZENS_MAX_JOB_CHECKPOINT_CHARS", 16_384, 1_024, 131_072
+            ),
+            max_job_recent_events=_integer(
+                values, "CITIZENS_MAX_JOB_RECENT_EVENTS", 8, 1, 64
+            ),
+            max_job_internal_steps=_integer(
+                values, "CITIZENS_MAX_JOB_INTERNAL_STEPS", 8, 1, 32
             ),
         )

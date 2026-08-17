@@ -27,6 +27,10 @@ CITIZENS_BRAIN_TOKEN_FILE=/run/secrets/citizens_brain_token
 CITIZENS_BRAIN_REQUEST_TIMEOUT_MS=150000
 # Bounds a complete model/tool loop, including a lost Numen completion callback.
 CITIZENS_BRAIN_TURN_TIMEOUT_MS=600000
+# Durable-job defaults. Paused time does not consume the active-time budget.
+CITIZENS_JOB_MAX_ACTIONS=128
+CITIZENS_JOB_MAX_MODEL_CALLS=192
+CITIZENS_JOB_MAX_ACTIVE_SECONDS=10800
 
 # Brain container
 CITIZENS_BRAIN_TOKEN_FILE=/run/secrets/citizens_brain_token
@@ -36,6 +40,11 @@ CITIZENS_LLM_MODEL=<tool-capable model name>
 CITIZENS_LLM_QUEUE_TIMEOUT_SECONDS=20
 CITIZENS_LLM_TIMEOUT_SECONDS=90
 CITIZENS_DB_PATH=/data/citizens-brain.sqlite3
+CITIZENS_MAX_ACTIVE_JOBS=16
+CITIZENS_MAX_JOB_CONTEXT_CHARS=65536
+CITIZENS_MAX_JOB_CHECKPOINT_CHARS=16384
+CITIZENS_MAX_JOB_RECENT_EVENTS=8
+CITIZENS_MAX_JOB_INTERNAL_STEPS=8
 ```
 
 Plain environment variables are supported for development, but Docker secret files
@@ -53,8 +62,9 @@ accepted maximum is 600,000 ms), or concurrent citizens can time out while waiti
 for the shared provider slot. This is capacity planning, not a hard provider
 wall-clock bound: a peer that continuously trickles bytes can outlive a socket
 timeout. The mod request timeout still releases the caller, and the ten-minute
-whole-turn watchdog clears local/physical work; an already-running provider request
-may consume one call after cancellation.
+watchdog clears an ordinary dialogue turn; an already-running provider request may
+consume one call after cancellation. Durable physical jobs instead use separately
+persisted action, model-call, and active-time budgets.
 
 ## What belongs in the modpack
 
@@ -87,6 +97,8 @@ such as Tailscale or an SSH tunnel. Do not open the brain listener to the intern
 
 Keep the current live server untouched until all seven stages pass.
 
-The server-owned release uses brain document protocol 2. Deploy its Forge jar and
-matching brain image together: a protocol-2 mod intentionally rejects an older
-protocol-1 brain health response before accepting tasks.
+The durable-job release uses brain document protocol 3. Deploy its Forge jar and
+matching brain image together: a protocol-3 mod intentionally rejects an older
+protocol-1 or protocol-2 brain health response before accepting dialogue or jobs.
+Back up and restore the Minecraft world and the brain SQLite volume together; they
+are the two coordinated halves of each durable job checkpoint.

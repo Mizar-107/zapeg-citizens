@@ -4,6 +4,8 @@ import com.google.gson.JsonArray;
 import io.github.mizar107.zapegcitizens.brain.BrainProtocol.ActorIdentity;
 import io.github.mizar107.zapegcitizens.brain.BrainProtocol.BrainReply;
 import io.github.mizar107.zapegcitizens.brain.BrainProtocol.CitizenIdentity;
+import io.github.mizar107.zapegcitizens.brain.BrainProtocol.JobReply;
+import io.github.mizar107.zapegcitizens.data.CitizenJobData.JobRecord;
 
 import java.net.http.HttpClient;
 import java.net.http.HttpRequest;
@@ -57,6 +59,57 @@ final class BrainHttpClient {
     CompletableFuture<Void> cancelRequest(UUID requestId) {
         return guarded(() -> post("/v1/turn/cancel", BrainProtocol.cancelRequestBody(requestId))
                 .thenApply(ignored -> null));
+    }
+
+    CompletableFuture<JobReply> startJob(
+            UUID requestId,
+            JobRecord job,
+            CitizenIdentity citizen,
+            JsonArray tools) {
+        return guarded(() -> post("/v1/job/start",
+                BrainProtocol.jobStartBody(requestId, job, citizen, tools))
+                .thenApply(BrainProtocol::parseJobReply));
+    }
+
+    CompletableFuture<JobReply> reportJobResult(
+            UUID requestId,
+            UUID jobId,
+            String actionId,
+            String resultJson) {
+        return guarded(() -> post("/v1/job/result",
+                BrainProtocol.jobResultBody(requestId, jobId, actionId, resultJson))
+                .thenApply(BrainProtocol::parseJobReply));
+    }
+
+    CompletableFuture<JobReply> resumeJob(
+            UUID requestId, JobRecord job, String answer) {
+        return guarded(() -> post("/v1/job/resume",
+                BrainProtocol.jobResumeBody(requestId, job, answer))
+                .thenApply(BrainProtocol::parseJobReply));
+    }
+
+    CompletableFuture<JobReply> pauseJob(
+            UUID requestId, UUID jobId, String reason) {
+        return guarded(() -> post("/v1/job/pause",
+                BrainProtocol.jobPauseBody(requestId, jobId, reason))
+                .thenApply(BrainProtocol::parseJobReply));
+    }
+
+    CompletableFuture<JobReply> cancelJob(
+            UUID requestId, UUID jobId, String reason) {
+        return guarded(() -> post("/v1/job/cancel",
+                BrainProtocol.jobCancelBody(requestId, jobId, reason))
+                .thenApply(BrainProtocol::parseJobReply));
+    }
+
+    CompletableFuture<JobReply> jobStatus(UUID jobId) {
+        return guarded(() -> post("/v1/job/status", BrainProtocol.jobStatusBody(jobId))
+                .thenApply(BrainProtocol::parseJobStatusReply));
+    }
+
+    CompletableFuture<List<JobReply>> listJobs(UUID citizenId) {
+        return guarded(() -> post("/v1/job/list", BrainProtocol.jobListBody(citizenId))
+                .thenApply(BrainProtocol::parseJobList));
     }
 
     CompletableFuture<Boolean> health() {

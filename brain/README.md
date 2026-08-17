@@ -2,7 +2,7 @@
 
 This is the private LLM sidecar for ZapeG Citizens. One instance can plan for every citizen while the Minecraft mod remains authoritative for identity, permissions, tools, movement, inventory, and combat. Players never receive the Ollama key.
 
-The service uses only the Python standard library. It provides Ollama-native `/api/chat` tool calling, SQLite conversation memory scoped to `citizen.id + actor.id`, authenticated HTTP, idempotent starts, persisted tool-waiting turns, and conservative resource limits. A process restart can resume a turn waiting for a Minecraft tool result. A turn that was inside an Ollama request cannot be resumed, so startup marks it failed immediately instead of blocking its citizen until the active-turn TTL; retry it with a new `request_id`.
+The service uses only the Python standard library. It provides Ollama-native `/api/chat` tool calling, SQLite conversation memory scoped to `citizen.id + actor.id`, authenticated HTTP, idempotent starts, persisted tool-waiting turns, durable multi-step jobs, and conservative resource limits. A process restart can resume work waiting for Minecraft. Ordinary turns that were inside an Ollama request are failed on startup; durable jobs instead return to their last checkpoint and can continue.
 
 ## Run it
 
@@ -23,7 +23,7 @@ For Ollama Cloud, keep `CITIZENS_LLM_URL=https://ollama.com/api/chat` and set th
 
 Secrets may instead be mounted as files with `CITIZENS_LLM_API_KEY_FILE` and `CITIZENS_BRAIN_TOKEN_FILE`. The service rejects configurations that set both a direct value and a file for the same secret. It never logs authorization headers, request bodies, provider payloads, or provider responses.
 
-## Protocol 2
+## Protocol 3
 
 All `/v1/*` requests require `Authorization: Bearer <CITIZENS_BRAIN_TOKEN>` and `Content-Type: application/json`. `GET /healthz` is intentionally unauthenticated for container health checks.
 
@@ -31,7 +31,7 @@ Start a turn with `POST /v1/turn/start`:
 
 ```json
 {
-  "protocol": 2,
+  "protocol": 3,
   "request_id": "a-unique-id-for-retries",
   "citizen": {
     "id": "citizen-uuid",
@@ -79,14 +79,14 @@ up to the hard maximum of 16,384).
 The response is either final speech:
 
 ```json
-{"protocol":2,"turn_id":"turn_...","kind":"final","speech":"On it."}
+{"protocol":3,"turn_id":"turn_...","kind":"final","speech":"On it."}
 ```
 
 or one server-validated tool request:
 
 ```json
 {
-  "protocol": 2,
+  "protocol": 3,
   "turn_id": "turn_...",
   "kind": "tool_call",
   "tool_call": {
@@ -101,7 +101,7 @@ After the mod executes that call, it posts the result to `POST /v1/turn/continue
 
 ```json
 {
-  "protocol": 2,
+  "protocol": 3,
   "turn_id": "turn_...",
   "tool_call_id": "call_...",
   "result": {"ok": true, "collected": 8}
@@ -113,26 +113,28 @@ Ollama can request parallel calls. The sidecar persists all of them, emits them 
 Cancel a waiting or executing turn with `POST /v1/turn/cancel`:
 
 ```json
-{"protocol":2,"turn_id":"turn_..."}
+{"protocol":3,"turn_id":"turn_..."}
 ```
 
 If the initial HTTP response was lost before the mod learned `turn_id`, cancel by the original idempotency key instead:
 
 ```json
-{"protocol":2,"request_id":"a-unique-id-for-retries"}
+{"protocol":3,"request_id":"a-unique-id-for-retries"}
 ```
 
 Provide exactly one of `turn_id` or `request_id`. Both forms resolve to the stored turn and repeated cancellation is safe. If request-ID cancellation arrives before start has inserted its row, the sidecar returns `kind: "canceled"` with `turn_id: null` and stores a bounded tombstone. A later start with that request ID is refused, closing the asynchronous stop/start race.
 
-`request_id` makes start retries idempotent. Only one turn may be active for each citizen regardless of actor, old active turns expire, the global number of active turns is capped, request/provider bodies are capped, and Ollama concurrency defaults to one. A request waits at most `CITIZENS_LLM_QUEUE_TIMEOUT_SECONDS` (20 seconds by default) for that slot and fails safely as busy instead of blocking forever. The default provider socket-operation timeout is 90 seconds. It is not a hard wall-clock ceiling for a peer that continuously trickles bytes; the mod's HTTP timeout and whole-turn watchdog are the authoritative caller-side bounds, although an already-running provider request may still consume one call after cancellation.
+`request_id` makes start retries idempotent. Only one turn may be active for each citizen regardless of actor, old active turns expire, the global number of active turns is capped, request/provider bodies are capped, and Ollama concurrency defaults to one. A request waits at most `CITIZENS_LLM_QUEUE_TIMEOUT_SECONDS` (20 seconds by default) for that slot and fails safely as busy instead of blocking forever. The default provider socket-operation timeout is 90 seconds. It is not a hard wall-clock ceiling for a peer that continuously trickles bytes; the mod's HTTP timeout and ordinary-dialogue watchdog are the authoritative caller-side bounds, although an already-running provider request may still consume one call after cancellation.
 
 Tool descriptions are limited individually by `CITIZENS_MAX_TOOL_DESCRIPTION_CHARS` (4,096 by default), which accommodates Numen's detailed BuildTool contract. The normalized collection remains independently bounded by `CITIZENS_MAX_TOOL_SCHEMA_BYTES` (131,072 bytes by default) and `CITIZENS_MAX_TOOLS` (64 by default). The per-description cap can be raised up to 65,536 characters when a pinned Numen version requires it without removing the aggregate request bound.
 
 Completed conversational memory is retained up to `CITIZENS_MAX_HISTORY_MESSAGES` for the exact citizen/actor pair. Separate terminal turn records support idempotent replay and contain the bounded execution trace; API maintenance prunes records older than `CITIZENS_TERMINAL_TURN_TTL_SECONDS` (one day by default) and caps them globally at `CITIZENS_MAX_TERMINAL_TURNS` (1,000 by default). Request-cancellation tombstones use the same maintenance-triggered age and count bounds. A `request_id` can be replayed or kept canceled only while its record remains inside both limits.
 
-For normal provider responses, budget the Minecraft mod's `CITIZENS_BRAIN_REQUEST_TIMEOUT_MS` above the sidecar queue timeout plus provider timeout and network overhead. The defaults are 20 + 90 seconds on the sidecar versus 150 seconds in the mod. This reduces ordinary queued-request timeouts but is not a hard total deadline because Python's provider timeout applies to socket operations. The mod also defaults `CITIZENS_BRAIN_TURN_TIMEOUT_MS` to 600,000 ms, which clears local/physical work if a complete model-and-tool loop hangs.
+For normal provider responses, budget the Minecraft mod's `CITIZENS_BRAIN_REQUEST_TIMEOUT_MS` above the sidecar queue timeout plus provider timeout and network overhead. The defaults are 20 + 90 seconds on the sidecar versus 150 seconds in the mod. This reduces ordinary queued-request timeouts but is not a hard total deadline because Python's provider timeout applies to socket operations. The mod also defaults `CITIZENS_BRAIN_TURN_TIMEOUT_MS` to 600,000 ms for ordinary dialogue. Durable physical jobs use their persisted action, model-call, and active-time budgets instead.
 
 `owner_kind` accepts `PLAYER` or `SERVER`. A player-owned citizen requires `owner_id`; a server-owned lore citizen may use `null`.
+
+Long-running construction, mining, combat, and inventory work uses the durable job routes rather than the conversational turn loop. The exact request/response contract, recovery behavior, and idempotency rules are in [JOBS-PROTOCOL.md](JOBS-PROTOCOL.md).
 
 ## Test
 

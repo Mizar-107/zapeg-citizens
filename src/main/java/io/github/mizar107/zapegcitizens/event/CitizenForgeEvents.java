@@ -4,11 +4,15 @@ import com.dwinovo.numen.entity.NumenPlayer;
 import io.github.mizar107.zapegcitizens.ZapeGCitizens;
 import io.github.mizar107.zapegcitizens.brain.CitizenBrainCoordinator;
 import io.github.mizar107.zapegcitizens.brain.CitizenBrainCoordinator.InteractionMode;
+import io.github.mizar107.zapegcitizens.brain.CitizenJobManager;
+import io.github.mizar107.zapegcitizens.brain.CitizenJobManager.JobOperation;
 import io.github.mizar107.zapegcitizens.chat.CitizenChatAddress;
 import io.github.mizar107.zapegcitizens.command.CitizenCommands;
 import io.github.mizar107.zapegcitizens.compat.NumenServerCompat;
 import io.github.mizar107.zapegcitizens.compat.brain.NumenToolGateway;
 import io.github.mizar107.zapegcitizens.data.CitizenRegistryData;
+import io.github.mizar107.zapegcitizens.data.CitizenJobData.JobRecord;
+import io.github.mizar107.zapegcitizens.data.CitizenJobData.JobState;
 import io.github.mizar107.zapegcitizens.lifecycle.ServerCitizenLifecycleManager;
 import io.github.mizar107.zapegcitizens.lifecycle.ServerCitizenLifecycleManager.LifecycleResult;
 import net.minecraft.network.chat.Component;
@@ -75,6 +79,9 @@ public final class CitizenForgeEvents {
                 : ServerCitizenLifecycleManager.instance().start(event.getServer())) {
             logLifecycleResult("startup", result);
         }
+        int jobs = CitizenJobManager.instance().reconcile(event.getServer());
+        ZapeGCitizens.LOGGER.info(
+                "[citizen-job] startup reconciliation scheduled {} durable job(s)", jobs);
     }
 
     @SubscribeEvent
@@ -185,16 +192,76 @@ public final class CitizenForgeEvents {
             }
         }
 
+        if (!serverOwned) {
+            CitizenJobManager jobs = CitizenJobManager.instance();
+            JobRecord activeJob = jobs.status(actor.server, record.citizenId()).orElse(null);
+            if (activeJob != null && activeJob.state() == JobState.NEEDS_INPUT) {
+                if (isStatus(address.prompt())) {
+                    actor.sendSystemMessage(Component.literal(
+                            "[Citizens] " + record.name() + ": " + jobs.formatStatus(activeJob)));
+                    return;
+                }
+                if (isStop(address.prompt())) {
+                    JobOperation operation = jobs.cancel(
+                            actor.server, record, "canceled by its assigned player");
+                    actor.sendSystemMessage(Component.literal(
+                            "[Citizens] " + operation.message()));
+                    return;
+                }
+                if (isResume(address.prompt())) {
+                    actor.sendSystemMessage(Component.literal(
+                            "[Citizens] "
+                                    + activeJob.message().orElse(
+                                            "This job still needs a concrete answer.")
+                                    + " Reply with @" + record.name()
+                                    + " answer <your answer>."));
+                    return;
+                }
+                JobOperation operation = jobs.resume(
+                        actor.server, record, answerText(address.prompt()));
+                actor.sendSystemMessage(Component.literal(
+                        "[Citizens] " + operation.message()));
+                return;
+            }
+            if (isStatus(address.prompt())) {
+                actor.sendSystemMessage(Component.literal(activeJob == null
+                        ? "[Citizens] " + record.name() + " has no active job."
+                        : "[Citizens] " + record.name() + ": " + jobs.formatStatus(activeJob)));
+                return;
+            }
+            if (isStop(address.prompt())) {
+                JobOperation operation = jobs.cancel(
+                        actor.server, record, "canceled by its assigned player");
+                actor.sendSystemMessage(Component.literal(
+                        "[Citizens] " + operation.message()));
+                return;
+            }
+            if (isResume(address.prompt()) && activeJob == null) {
+                actor.sendSystemMessage(Component.literal(
+                        "[Citizens] " + record.name() + " has no paused job to resume."));
+                return;
+            }
+            if (activeJob != null) {
+                if (isResume(address.prompt())) {
+                    JobOperation operation = jobs.resume(actor.server, record, "");
+                    actor.sendSystemMessage(Component.literal(
+                            "[Citizens] " + operation.message()));
+                    return;
+                }
+                actor.sendSystemMessage(Component.literal(
+                        "[Citizens] " + record.name() + " already has "
+                                + jobs.formatStatus(activeJob)
+                                + ". Use @" + record.name() + " status or @"
+                                + record.name() + " stop."));
+                return;
+            }
+        }
+
         NumenPlayer citizen = NumenServerCompat.findLiveManaged(
                 actor.server, record.citizenId(), record.bodyOwnerId());
         if (citizen == null) {
             actor.sendSystemMessage(Component.literal(
                     "[Citizens] " + record.name() + " is currently dormant or respawning."));
-            return;
-        }
-
-        if (!serverOwned && isStop(address.prompt())) {
-            CitizenBrainCoordinator.instance().stop(actor, record, citizen);
             return;
         }
 
@@ -207,12 +274,17 @@ public final class CitizenForgeEvents {
         }
         LAST_TASK_TICK.put(actor.getUUID(), now);
 
-        CitizenBrainCoordinator.instance().submit(
-                actor,
-                record,
-                citizen,
-                address.prompt(),
-                serverOwned ? InteractionMode.DIALOGUE : InteractionMode.TASK);
+        if (serverOwned) {
+            CitizenBrainCoordinator.instance().submit(
+                    actor, record, citizen, address.prompt(), InteractionMode.DIALOGUE);
+        } else {
+            JobOperation operation = CitizenJobManager.instance().submit(
+                    actor, record, citizen, address.prompt());
+            if (!operation.successful()) {
+                actor.sendSystemMessage(Component.literal(
+                        "[Citizens] " + operation.message()));
+            }
+        }
     }
 
     private static boolean isStop(String prompt) {
@@ -221,6 +293,32 @@ public final class CitizenForgeEvents {
                 || normalized.equals("cancel")
                 || normalized.equals("dur")
                 || normalized.equals("iptal");
+    }
+
+    private static boolean isStatus(String prompt) {
+        String normalized = prompt.strip().toLowerCase(java.util.Locale.ROOT);
+        return normalized.equals("status")
+                || normalized.equals("progress")
+                || normalized.equals("durum");
+    }
+
+    private static boolean isResume(String prompt) {
+        String normalized = prompt.strip().toLowerCase(java.util.Locale.ROOT);
+        return normalized.equals("resume")
+                || normalized.equals("continue")
+                || normalized.equals("devam");
+    }
+
+    private static String answerText(String prompt) {
+        String stripped = prompt.strip();
+        String normalized = stripped.toLowerCase(java.util.Locale.ROOT);
+        if (normalized.startsWith("answer ")) {
+            return stripped.substring("answer ".length()).strip();
+        }
+        if (normalized.startsWith("cevap ")) {
+            return stripped.substring("cevap ".length()).strip();
+        }
+        return stripped;
     }
 
     private static void logLifecycleResult(String phase, LifecycleResult result) {
