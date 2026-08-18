@@ -252,6 +252,58 @@ class DurableJobTest(TempDatabaseTest, unittest.TestCase):
         context = json.dumps(provider.calls[-1][0], ensure_ascii=False)
         self.assertIn("Use spruce with a stone foundation.", context)
 
+    def test_planner_is_told_dimension_travel_is_unavailable(self) -> None:
+        provider = FakeProvider(reply("look_around", {}))
+        service = self.service(provider)
+        service.start(job_payload(goal="Go to the Nether and bring me glowstone."))
+        system = provider.calls[0][0][0]["content"]
+        self.assertIn("no portal, teleport, or dimension-crossing tool", system)
+        self.assertIn("Never promise or attempt cross-dimension travel", system)
+        self.assertIn("job_needs_input", system)
+
+    def test_planner_can_declare_an_impossible_request_blocker(self) -> None:
+        provider = FakeProvider(
+            reply(
+                "job_needs_input",
+                {
+                    "phase": "blocked",
+                    "summary": "The goal needs another dimension.",
+                    "question": "I can't reach the Nether: I have no way to cross "
+                    "dimensions. Bring me glowstone yourself, or move me there first.",
+                },
+            )
+        )
+        service = self.service(provider)
+        blocked = service.start(
+            job_payload(goal="Go to the Nether and bring me glowstone.")
+        )
+        self.assertEqual("NEEDS_INPUT", blocked["kind"])
+        self.assertIn("no way to cross", blocked["question"])
+        stored = service.store.get_job("job-1")
+        assert stored is not None
+        self.assertEqual("NEEDS_INPUT", stored.state)
+        # The declaration is durable, so a no-answer resume replays it without a model call.
+        replay = service.resume(resume_payload("resume-no-answer", "job-1"))
+        self.assertEqual(blocked, replay)
+        self.assertEqual(1, len(provider.calls))
+
+    def test_planner_can_state_a_material_requirement(self) -> None:
+        provider = FakeProvider(
+            reply(
+                "job_needs_input",
+                {
+                    "phase": "materials",
+                    "summary": "The build is short on supplies.",
+                    "question": "I need 64 cobblestone and 32 spruce planks in my "
+                    "inventory before I can start the walls.",
+                },
+            )
+        )
+        service = self.service(provider)
+        blocked = service.start(job_payload(goal="Build me a small house."))
+        self.assertEqual("NEEDS_INPUT", blocked["kind"])
+        self.assertIn("64 cobblestone", blocked["question"])
+
     def test_mutating_pending_action_becomes_interrupted_and_requires_observation(self) -> None:
         first_provider = FakeProvider(
             reply("mine", {"block_ids": ["minecraft:diamond_ore"], "count": 5})

@@ -232,6 +232,8 @@ Paused, canceled, failed, budget-exhausted, or safely halted work:
 
 The provider must produce exactly one native tool call per pass. `job_define_plan`, `job_checkpoint`, `job_needs_input`, and `job_finish` are private planner tools and are never sent to Minecraft as actions. Several bounded internal planner passes may occur within one HTTP request, but the response contains no more than one world action. `job_finish` is rejected unless it cites successful, meaningful confirmed evidence; workflow loading alone is insufficient, and every mutating result must be followed by a cited successful read-only verification.
 
+`job_needs_input` is the explicit blocker/requirement channel, not only a literal question. The planner is told its hard capability limits (on-foot movement within the current dimension only; no portal, teleport, or dimension-crossing tool) and is instructed to call `job_needs_input` immediately when a goal needs an unavailable capability, an unreachable place, or owner-supplied materials/tools, stating exactly what is needed or what cannot be done and why. The `question` field carries that requirement/blocker text; Forge delivers it to the owner as the citizen's own speech and the job waits for an answer or cancellation.
+
 ## Persistence and limits
 
 SQLite stores the job snapshot, immutable goal, supplied tools and budgets, structured plan, compact checkpoint, event journal, request-response replay records, and at most one pending action. A startup recovery changes an interrupted model-call state from `CALLING` to `READY`; it does not discard checkpoints. A waiting action survives restarts. Jobs have no idle TTL and remain until explicitly completed or canceled.

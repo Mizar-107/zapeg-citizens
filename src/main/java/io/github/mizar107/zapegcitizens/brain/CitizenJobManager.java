@@ -949,7 +949,8 @@ public final class CitizenJobManager {
                 current.lastConfirmedActionId(),
                 Optional.of(question),
                 now));
-        tellActor(server, job, "[Citizens] " + question);
+        // The citizen speaks for itself when it needs something, matching completion speech.
+        tellActor(server, job, "[" + citizenName(server, job.citizenId()) + "] " + question);
     }
 
     private void complete(

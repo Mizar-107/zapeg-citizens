@@ -42,6 +42,14 @@ physical action at a time. Minecraft writes and synchronously asks its `SavedDat
 pending action before calling Numen, and the brain commits it to SQLite before returning it to
 Minecraft. Results are journaled under stable action IDs and result requests are idempotent.
 
+The planner knows its hard capability limits and says so instead of stalling. Movement and every
+world tool act only on foot within the citizen's current dimension; there is no portal, teleport, or
+dimension-crossing tool, so blocks, ores, structures, and biomes in other dimensions are
+unreachable. When a goal needs an unavailable capability, an unreachable place, or something the
+owner must first supply (materials, a tool, a cleared site), the citizen pauses and tells the owner
+exactly what is needed or what cannot be done and why, in its own voice, rather than burning the
+action budget on futile movement or searches.
+
 Player-owned jobs pause when the owner or body leaves and resume when both return. Server-owned
 jobs continue if the submitting operator logs out. On server shutdown, body death, a lost HTTP
 reply, or a mid-action crash, the job remains recoverable. A mutating action with an unknown outcome
@@ -93,7 +101,9 @@ arguments for a detailed compact structure plan; other tools keep the 16 KiB cap
   blueprint.
 - **Wither skeletons:** repeated locate/scan/type-check/attack cycles work when the citizen is already
   in the Nether near an accessible fortress. Numen 0.1.1 has no reliable cross-dimension portal tool,
-  so an autonomous Overworld-to-Nether-and-back expedition is not promised yet.
+  so an autonomous Overworld-to-Nether-and-back expedition is not promised yet. Asked to fetch
+  Nether-only resources such as glowstone from the Overworld, the citizen now refuses the crossing
+  out loud and states what it would need instead of silently searching.
 
 Test long jobs on a copied world before relying on them in the live ATM9 world. The durable journal
 protects control flow and recovery; it cannot make an unreachable block, missing tool, unloaded ore,
