@@ -42,6 +42,7 @@ class SettingsTest(unittest.TestCase):
         self.assertEqual(16_384, configured.max_job_checkpoint_chars)
         self.assertEqual(8, configured.max_job_recent_events)
         self.assertEqual(8, configured.max_job_internal_steps)
+        self.assertEqual(2, configured.max_job_planner_retries)
 
     def test_direct_and_file_secret_cannot_both_be_set(self) -> None:
         with self.assertRaisesRegex(ValueError, "set only one"):

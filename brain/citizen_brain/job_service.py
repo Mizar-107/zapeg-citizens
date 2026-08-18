@@ -11,7 +11,7 @@ from typing import Any, Callable, Mapping
 from uuid import uuid4
 
 from .config import Settings
-from .provider import ChatProvider, ProviderError, ProviderReply
+from .provider import ChatProvider, ProviderError, ProviderReply, ProviderToolCall
 from .service import ApiError, BrainService, PROTOCOL_VERSION
 from .storage import JobOperationTransition, JobRecord, SQLiteStore, StoreError
 
@@ -53,6 +53,10 @@ _INTERNAL_ORDER = (
     "job_finish",
 )
 _INTERNAL_NAMES = frozenset(_INTERNAL_ORDER)
+
+
+class _PlannerFault(RuntimeError):
+    """A retryable planner reply fault, journaled before the model is re-asked."""
 
 
 def _function_tool(name: str, description: str, properties: dict[str, Any], required: list[str]) -> dict[str, Any]:
@@ -383,6 +387,11 @@ class JobService:
         return self._project(transition.job)
 
     def _advance(self, job: JobRecord) -> dict[str, Any]:
+        # A single malformed or transient planner reply must not stall the job:
+        # the fault is journaled into the model-visible event window and the
+        # planner is re-asked, up to a bounded number of consecutive faults.
+        # Deterministic stops (budgets, oversized context) still pause at once.
+        planner_failures = 0
         for _ in range(self.settings.max_job_internal_steps):
             budget_reason = self._budget_reason(job, before_model=True)
             if budget_reason is not None:
@@ -392,41 +401,58 @@ class JobService:
             except StoreError as exc:
                 raise self._store_error(exc) from exc
 
+            fault: str | None = None
+            call: ProviderToolCall | None = None
             try:
                 messages = self._messages(calling)
                 provider_tools = self._provider_tools(calling)
                 reply = self.provider.chat(messages, provider_tools)
                 call = self._one_call(reply)
             except ApiError as exc:
+                # Context-size and protocol rejections cannot be fixed by re-asking.
                 return self._pause_internal(calling, self._bounded(exc.message, _REASON_CHARS))
             except ProviderError as exc:
-                return self._pause_internal(calling, self._bounded(str(exc), _REASON_CHARS))
+                fault = self._bounded(str(exc), _REASON_CHARS)
             except Exception:
-                return self._pause_internal(calling, "provider request failed")
+                fault = "provider request failed"
 
-            if call.name in _INTERNAL_NAMES:
-                outcome = self._internal(calling, call.name, call.arguments)
-                if isinstance(outcome, dict):
-                    return outcome
-                job = outcome
+            if fault is None and call is not None and call.name in _INTERNAL_NAMES:
+                try:
+                    outcome = self._internal(calling, call.name, call.arguments)
+                except _PlannerFault as exc:
+                    fault = self._bounded(str(exc), _REASON_CHARS)
+                else:
+                    if isinstance(outcome, dict):
+                        return outcome
+                    job = outcome
+                    planner_failures = 0
+                    continue
+
+            if fault is None and call is not None and call.name not in _INTERNAL_NAMES:
+                fault = self._world_call_fault(calling, call)
+
+            if fault is not None:
+                planner_failures += 1
+                if planner_failures > self.settings.max_job_planner_retries:
+                    return self._pause_internal(calling, fault)
+                try:
+                    job = self.store.record_job_planner_error(
+                        job_id=calling.job_id,
+                        reason=fault,
+                        now=self._clock(),
+                    )
+                except StoreError as exc:
+                    raise self._store_error(exc) from exc
                 continue
 
-            allowed = {tool["function"]["name"] for tool in calling.tools}
-            if call.name not in allowed:
-                return self._pause_internal(calling, "planner requested an unavailable world tool")
-            if calling.recovery_required and call.name not in READ_ONLY_WORLD_TOOLS:
+            if call is None or call.name in _INTERNAL_NAMES:
+                # Unreachable: internal calls return, continue, or fault above.
                 return self._pause_internal(
-                    calling,
-                    "recovery requires a read-only observation before more world changes",
+                    calling, "planner requested an unknown internal job tool"
                 )
             if calling.actions_completed >= calling.budgets["max_actions"]:
+                # Re-asking cannot create more budget; stop deterministically.
                 return self._pause_internal(calling, "action budget exhausted")
-            try:
-                encoded_arguments = self._json(call.arguments)
-            except (TypeError, ValueError) as exc:
-                return self._pause_internal(calling, "planner returned invalid action arguments")
-            if len(encoded_arguments) > self.settings.max_tool_argument_chars:
-                return self._pause_internal(calling, "world-action arguments exceed the configured limit")
 
             action = {
                 "id": f"action_{uuid4().hex}",
@@ -449,6 +475,21 @@ class JobService:
             return response
         return self._pause_internal(job, "planner exceeded the internal transition limit")
 
+    def _world_call_fault(self, job: JobRecord, call: ProviderToolCall) -> str | None:
+        """Return the retryable planner fault for a requested world action, if any."""
+        allowed = {tool["function"]["name"] for tool in job.tools}
+        if call.name not in allowed:
+            return "planner requested an unavailable world tool"
+        if job.recovery_required and call.name not in READ_ONLY_WORLD_TOOLS:
+            return "recovery requires a read-only observation before more world changes"
+        try:
+            encoded_arguments = self._json(call.arguments)
+        except (TypeError, ValueError):
+            return "planner returned invalid action arguments"
+        if len(encoded_arguments) > self.settings.max_tool_argument_chars:
+            return "world-action arguments exceed the configured limit"
+        return None
+
     def _internal(
         self,
         job: JobRecord,
@@ -456,7 +497,7 @@ class JobService:
         arguments: Any,
     ) -> JobRecord | dict[str, Any]:
         if not isinstance(arguments, dict):
-            return self._pause_internal(job, f"{name} arguments must be an object")
+            raise _PlannerFault(f"{name} arguments must be an object")
         try:
             if name == "job_define_plan":
                 phase = self._arg_text(arguments, "phase", _PHASE_CHARS)
@@ -511,8 +552,8 @@ class JobService:
 
             if name == "job_finish":
                 if job.recovery_required:
-                    return self._pause_internal(
-                        job, "job cannot finish before interrupted work is re-observed"
+                    raise _PlannerFault(
+                        "job cannot finish before interrupted work is re-observed"
                     )
                 phase = self._arg_text(arguments, "phase", _PHASE_CHARS)
                 summary = self._arg_text(arguments, "summary", _SUMMARY_CHARS)
@@ -531,16 +572,16 @@ class JobService:
                     if item["success"]
                 }
                 if not evidence or any(action_id not in confirmed for action_id in evidence):
-                    return self._pause_internal(
-                        job, "job_finish requires successful confirmed action evidence"
+                    raise _PlannerFault(
+                        "job_finish requires successful confirmed action evidence"
                     )
                 selected = [confirmed[action_id] for action_id in evidence]
                 meaningful = [
                     item for item in selected if item["action_name"] != "load_skill"
                 ]
                 if not meaningful:
-                    return self._pause_internal(
-                        job, "job_finish cannot rely only on workflow-loading evidence"
+                    raise _PlannerFault(
+                        "job_finish cannot rely only on workflow-loading evidence"
                     )
                 mutations = [
                     item
@@ -556,10 +597,9 @@ class JobService:
                         for item in selected
                     )
                     if not verified_after:
-                        return self._pause_internal(
-                            job,
+                        raise _PlannerFault(
                             "job_finish requires a successful read-only verification "
-                            "after the latest mutation",
+                            "after the latest mutation"
                         )
                 response = self._completed_flow(job, phase, summary, speech)
                 self.store.finish_job(
@@ -576,8 +616,8 @@ class JobService:
             if isinstance(exc, StoreError):
                 raise self._store_error(exc) from exc
             message = exc.message if isinstance(exc, ApiError) else str(exc)
-            return self._pause_internal(job, self._bounded(message, _REASON_CHARS))
-        return self._pause_internal(job, "planner requested an unknown internal job tool")
+            raise _PlannerFault(self._bounded(message, _REASON_CHARS)) from exc
+        raise _PlannerFault("planner requested an unknown internal job tool")
 
     def _one_call(self, reply: ProviderReply):
         if not isinstance(reply, ProviderReply):

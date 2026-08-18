@@ -46,6 +46,9 @@ public final class CitizenJobManager {
 
     private static final CitizenJobManager INSTANCE = new CitizenJobManager();
     private static final int BUDGET_ACCOUNT_INTERVAL_TICKS = 20;
+    private static final long BRAIN_RETRY_BASE_TICKS = 100L;
+    private static final long BRAIN_RETRY_MAX_TICKS = 1_200L;
+    private static final int BRAIN_RETRY_MAX_ATTEMPTS = 6;
     private static final Set<String> READ_ONLY_TOOLS = Set.of(
             "get_self_status",
             "get_owner_status",
@@ -73,6 +76,9 @@ public final class CitizenJobManager {
     private final Map<UUID, UUID> inFlight = new ConcurrentHashMap<>();
     private final Map<UUID, UUID> cancelInFlight = new ConcurrentHashMap<>();
     private final Map<UUID, Long> nextCancelRetryAt = new ConcurrentHashMap<>();
+    private final Map<UUID, Long> nextBrainRetryAt = new ConcurrentHashMap<>();
+    private final Map<UUID, Integer> brainRetryAttempts = new ConcurrentHashMap<>();
+    private final Set<UUID> brainPauseNotified = ConcurrentHashMap.newKeySet();
 
     private MinecraftServer attachedServer;
     private long lastBudgetAccountAt;
@@ -426,6 +432,22 @@ public final class CitizenJobManager {
                                 Optional.of("recovering an interrupted action"),
                                 now)).orElseThrow();
             }
+            if (needsPlanningRecovery(job)) {
+                // A mid-planning RUNNING job whose in-flight brain reply was lost to a restart
+                // has no driver and no pending action, and resume() rejects RUNNING. Move it to
+                // a resumable pause so the brain continues from its durable checkpoint.
+                long now = server.overworld().getGameTime();
+                job = CitizenJobData.get(server).update(job.jobId(), current ->
+                        current.transition(
+                                JobState.PAUSED,
+                                current.progress(),
+                                current.actionsCompleted(),
+                                current.activeTicks(),
+                                current.pendingAction(),
+                                current.lastConfirmedActionId(),
+                                Optional.of("recovering an interrupted planning step"),
+                                now)).orElseThrow();
+            }
             JobOperation operation = resume(server, job.jobId(), "");
             if (operation.successful()) {
                 scheduled++;
@@ -522,9 +544,46 @@ public final class CitizenJobManager {
                     now));
         }
         for (JobRecord job : CitizenJobData.get(server).all()) {
+            if (job.state().terminal()) {
+                nextBrainRetryAt.remove(job.jobId());
+                brainRetryAttempts.remove(job.jobId());
+                brainPauseNotified.remove(job.jobId());
+                continue;
+            }
             if (job.state() == JobState.PAUSED_BODY || job.state() == JobState.PAUSED_OWNER) {
                 resumeEligible(server, job.citizenId());
+            } else if (job.state() == JobState.PAUSED_BRAIN) {
+                maybeRetryBrain(server, job, now);
             }
+        }
+    }
+
+    /**
+     * Re-drives a job whose brain round-trip failed, with bounded exponential backoff. A
+     * transient brain restart then recovers on its own; once the attempts are exhausted the job
+     * stays paused and the earlier pause notification tells the actor how to resume by hand.
+     */
+    private void maybeRetryBrain(MinecraftServer server, JobRecord job, long now) {
+        if (http == null || inFlight.containsKey(job.jobId())) {
+            return;
+        }
+        if (now < nextBrainRetryAt.getOrDefault(job.jobId(), 0L)) {
+            return;
+        }
+        int attempts = brainRetryAttempts.getOrDefault(job.jobId(), 0);
+        if (!shouldRetryBrain(attempts)) {
+            return;
+        }
+        brainRetryAttempts.put(job.jobId(), attempts + 1);
+        nextBrainRetryAt.put(job.jobId(), now + brainRetryDelayTicks(attempts));
+        ZapeGCitizens.LOGGER.info(
+                "[citizen-job] retrying brain contact job={} attempt={}",
+                job.jobId(), attempts + 1);
+        JobOperation operation = resume(server, job.jobId(), "");
+        if (!operation.successful()) {
+            ZapeGCitizens.LOGGER.debug(
+                    "[citizen-job] brain retry deferred job={} reason={}",
+                    job.jobId(), operation.message());
         }
     }
 
@@ -543,6 +602,9 @@ public final class CitizenJobManager {
         inFlight.clear();
         cancelInFlight.clear();
         nextCancelRetryAt.clear();
+        nextBrainRetryAt.clear();
+        brainRetryAttempts.clear();
+        brainPauseNotified.clear();
         attachedServer = null;
     }
 
@@ -669,6 +731,10 @@ public final class CitizenJobManager {
             pauseLocal(server, job, "the brain returned a mismatched job identity", false);
             return;
         }
+        // A valid reply proves the brain is reachable again; reset the PAUSED_BRAIN backoff.
+        nextBrainRetryAt.remove(jobId);
+        brainRetryAttempts.remove(jobId);
+        brainPauseNotified.remove(jobId);
 
         if (acknowledgedActionId != null) {
             PendingAction pending = job.pendingAction().orElse(null);
@@ -982,6 +1048,48 @@ public final class CitizenJobManager {
         ZapeGCitizens.LOGGER.warn(
                 "[citizen-job] paused job={} citizen={} reason={}",
                 job.jobId(), job.citizenId(), reason);
+        notifyPause(server, job, pauseState, reason);
+    }
+
+    /**
+     * Tells the submitting actor why a job stopped and how to get it moving again. Only the
+     * states that do not recover on their own are announced, and only on a fresh transition, so
+     * routine body/owner pauses and repeated recovery passes do not spam chat.
+     */
+    private void notifyPause(
+            MinecraftServer server, JobRecord job, JobState pauseState, String reason) {
+        if (job.state() == pauseState) {
+            return;
+        }
+        // A brain outage auto-retries through RUNNING and back; announce only the first
+        // transition of each outage so the backoff cycles do not spam chat.
+        if (pauseState == JobState.PAUSED_BRAIN && !brainPauseNotified.add(job.jobId())) {
+            return;
+        }
+        String advice = pauseAdvice(server, job, pauseState);
+        if (advice == null) {
+            return;
+        }
+        tellActor(server, job, "[Citizens] " + citizenName(server, job.citizenId())
+                + " paused job " + shortId(job.jobId()) + ": " + reason + ". " + advice);
+    }
+
+    private static String pauseAdvice(
+            MinecraftServer server, JobRecord job, JobState pauseState) {
+        String name = citizenName(server, job.citizenId());
+        boolean serverOwned = CitizenRegistryData.get(server).findByCitizenId(job.citizenId())
+                .map(record -> record.logicalOwner().kind() == OwnerKind.SERVER)
+                .orElse(false);
+        String resume = serverOwned ? "/citizen resume " + name : "@" + name + " resume";
+        String stop = serverOwned ? "/citizen stop " + name : "@" + name + " stop";
+        return switch (pauseState) {
+            case PAUSED -> "Resume with " + resume + ", or cancel with " + stop + ".";
+            case PAUSED_BRAIN -> "The shared brain is unreachable; retrying automatically for "
+                    + "a few minutes. If this persists, check the brain, then use " + resume + ".";
+            case PAUSED_BUDGET -> "The job used its configured budget and cannot resume; "
+                    + "cancel it with " + stop + ".";
+            default -> null;
+        };
     }
 
     private void failLocal(MinecraftServer server, JobRecord job, String requestedReason) {
@@ -1142,6 +1250,9 @@ public final class CitizenJobManager {
             inFlight.clear();
             cancelInFlight.clear();
             nextCancelRetryAt.clear();
+            nextBrainRetryAt.clear();
+            brainRetryAttempts.clear();
+            brainPauseNotified.clear();
         }
     }
 
@@ -1205,6 +1316,28 @@ public final class CitizenJobManager {
                 || state == JobState.PAUSED_OWNER
                 || state == JobState.PAUSED_BRAIN
                 || state == JobState.PAUSED_SHUTDOWN;
+    }
+
+    /**
+     * True for a job orphaned mid-planning by a restart: it is still marked RUNNING with an
+     * acknowledged (non-queued) plan, but it has no pending action and no in-flight reply will
+     * ever arrive, and resume() refuses RUNNING. Such a job must be moved to a resumable pause.
+     */
+    static boolean needsPlanningRecovery(JobRecord job) {
+        return job != null
+                && job.state() == JobState.RUNNING
+                && job.pendingAction().isEmpty()
+                && !job.progress().equals(JobProgress.queued());
+    }
+
+    static boolean shouldRetryBrain(int attempts) {
+        return attempts >= 0 && attempts < BRAIN_RETRY_MAX_ATTEMPTS;
+    }
+
+    static long brainRetryDelayTicks(int attempt) {
+        int shift = Math.max(0, attempt);
+        long scaled = shift >= 20 ? Long.MAX_VALUE : BRAIN_RETRY_BASE_TICKS << shift;
+        return Math.min(scaled, BRAIN_RETRY_MAX_TICKS);
     }
 
     private static String boundedResult(String result) {

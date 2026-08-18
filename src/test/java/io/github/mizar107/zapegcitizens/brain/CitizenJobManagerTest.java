@@ -98,4 +98,95 @@ class CitizenJobManagerTest {
         assertFalse(CitizenJobManager.isResumableState(JobState.CANCELING));
         assertFalse(CitizenJobManager.isResumableState(JobState.COMPLETED));
     }
+
+    @Test
+    void orphanedMidPlanningJobIsFlaggedForRecovery() {
+        JobRecord acknowledged = baseJob(JobState.RUNNING, new JobProgress(
+                "gathering", "The brain acknowledged the first action."));
+        // Still marked RUNNING with a non-queued plan and no pending action: orphaned.
+        assertTrue(CitizenJobManager.needsPlanningRecovery(acknowledged));
+
+        // The initial-start window stays with the idempotent /start retry path instead.
+        assertFalse(CitizenJobManager.needsPlanningRecovery(
+                baseJob(JobState.RUNNING, JobProgress.queued())));
+        assertFalse(CitizenJobManager.needsPlanningRecovery(
+                baseJob(JobState.QUEUED, JobProgress.queued())));
+
+        // A job holding a pending action is recovered through the uncertain-action path.
+        JobRecord withPending = acknowledged.transition(
+                JobState.WAITING_ACTION,
+                acknowledged.progress(),
+                0,
+                0,
+                Optional.of(pendingAction()),
+                Optional.empty(),
+                Optional.empty(),
+                30);
+        assertFalse(CitizenJobManager.needsPlanningRecovery(withPending));
+
+        // Paused/terminal states are driven by their own resume/finish paths.
+        assertFalse(CitizenJobManager.needsPlanningRecovery(acknowledged.transition(
+                JobState.PAUSED,
+                acknowledged.progress(),
+                0,
+                0,
+                Optional.empty(),
+                Optional.empty(),
+                Optional.of("paused"),
+                30)));
+        assertFalse(CitizenJobManager.needsPlanningRecovery(null));
+    }
+
+    @Test
+    void brainRetryBackoffIsBoundedAndCapped() {
+        assertTrue(CitizenJobManager.shouldRetryBrain(0));
+        assertTrue(CitizenJobManager.shouldRetryBrain(5));
+        assertFalse(CitizenJobManager.shouldRetryBrain(6));
+        assertFalse(CitizenJobManager.shouldRetryBrain(-1));
+
+        long previous = -1;
+        for (int attempt = 0; attempt < 6; attempt++) {
+            long delay = CitizenJobManager.brainRetryDelayTicks(attempt);
+            assertTrue(delay > 0, "delay must be positive");
+            assertTrue(delay <= 1_200L, "delay must be capped at the maximum");
+            assertTrue(delay >= previous, "backoff must never shrink");
+            previous = delay;
+        }
+        assertTrue(CitizenJobManager.brainRetryDelayTicks(5) == 1_200L);
+        // A pathological attempt index can never overflow into a negative delay.
+        assertTrue(CitizenJobManager.brainRetryDelayTicks(40) == 1_200L);
+    }
+
+    private static JobRecord baseJob(JobState state, JobProgress progress) {
+        return new JobRecord(
+                UUID.randomUUID(),
+                UUID.randomUUID(),
+                UUID.randomUUID(),
+                UUID.randomUUID(),
+                "Alice",
+                "collect iron",
+                new ActorContext("minecraft:overworld", 1, 64, 2, 0, 0, Optional.empty()),
+                new JobBudget(128, 192, 10_800),
+                state,
+                progress,
+                0,
+                0,
+                Optional.empty(),
+                Optional.empty(),
+                Optional.empty(),
+                10,
+                20);
+    }
+
+    private static io.github.mizar107.zapegcitizens.data.CitizenJobData.PendingAction
+            pendingAction() {
+        return new io.github.mizar107.zapegcitizens.data.CitizenJobData.PendingAction(
+                "action-1",
+                "exec-1",
+                "mine",
+                "{}",
+                false,
+                false,
+                Optional.empty());
+    }
 }

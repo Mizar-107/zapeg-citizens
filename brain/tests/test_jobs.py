@@ -4,7 +4,7 @@ import json
 import unittest
 
 from citizen_brain.job_service import JobService
-from citizen_brain.provider import ProviderReply, ProviderToolCall
+from citizen_brain.provider import ProviderError, ProviderReply, ProviderToolCall
 from citizen_brain.service import ApiError
 from citizen_brain.storage import SQLiteStore
 
@@ -356,22 +356,136 @@ class DurableJobTest(TempDatabaseTest, unittest.TestCase):
         self.assertEqual(1, len(provider.calls))
 
     def test_finish_requires_at_least_one_confirmed_action_id(self) -> None:
-        service = self.service(
-            FakeProvider(
-                reply(
-                    "job_finish",
-                    {
-                        "phase": "complete",
-                        "summary": "Claimed completion without evidence.",
-                        "speech": "Done.",
-                        "evidence_action_ids": [],
-                    },
-                )
-            )
+        premature_finish = reply(
+            "job_finish",
+            {
+                "phase": "complete",
+                "summary": "Claimed completion without evidence.",
+                "speech": "Done.",
+                "evidence_action_ids": [],
+            },
         )
+        provider = FakeProvider(premature_finish, premature_finish, premature_finish)
+        service = self.service(provider)
         paused = service.start(job_payload())
         self.assertEqual("PAUSED", paused["kind"])
         self.assertIn("confirmed action evidence", paused["reason"])
+        # One initial attempt plus the bounded planner retries were all journaled.
+        self.assertEqual(3, len(provider.calls))
+        stored = service.store.get_job("job-1")
+        assert stored is not None
+        self.assertEqual("PAUSED", stored.state)
+        events = service.store.recent_job_events("job-1", 16)
+        faults = [event for event in events if event["type"] == "planner_error"]
+        self.assertEqual(2, len(faults))
+        self.assertIn("confirmed action evidence", faults[0]["payload"]["reason"])
+
+    def test_finish_fault_feedback_lets_the_planner_recover_and_act(self) -> None:
+        premature_finish = reply(
+            "job_finish",
+            {
+                "phase": "complete",
+                "summary": "Claimed completion without evidence.",
+                "speech": "Done.",
+                "evidence_action_ids": [],
+            },
+        )
+        provider = FakeProvider(premature_finish, reply("look_around", {}))
+        service = self.service(provider)
+        started = service.start(job_payload())
+        self.assertEqual("ACTION", started["kind"])
+        self.assertEqual("look_around", started["action"]["name"])
+        self.assertEqual(2, len(provider.calls))
+        feedback = json.dumps(provider.calls[-1][0], ensure_ascii=False)
+        self.assertIn("planner_error", feedback)
+        self.assertIn("confirmed action evidence", feedback)
+
+    def test_malformed_planner_reply_is_journaled_and_retried(self) -> None:
+        prose = ProviderReply(
+            content="I will look around first.",
+            assistant_message={
+                "role": "assistant",
+                "content": "I will look around first.",
+            },
+            tool_calls=(),
+        )
+        provider = FakeProvider(prose, reply("look_around", {}))
+        service = self.service(provider)
+        started = service.start(job_payload())
+        self.assertEqual("ACTION", started["kind"])
+        self.assertEqual("look_around", started["action"]["name"])
+        self.assertEqual(2, len(provider.calls))
+        feedback = json.dumps(provider.calls[-1][0], ensure_ascii=False)
+        self.assertIn("planner_error", feedback)
+        self.assertIn("exactly one", feedback)
+        stored = service.store.get_job("job-1")
+        assert stored is not None
+        self.assertEqual("WAITING_ACTION", stored.state)
+
+    def test_transient_provider_error_is_retried_before_pausing(self) -> None:
+        class FlakyProvider:
+            def __init__(self) -> None:
+                self.calls = 0
+
+            def chat(self, messages: object, tools: object) -> ProviderReply:
+                self.calls += 1
+                if self.calls == 1:
+                    raise ProviderError("provider is busy")
+                return reply("look_around", {})
+
+        provider = FlakyProvider()
+        service = self.service(provider)  # type: ignore[arg-type]
+        started = service.start(job_payload())
+        self.assertEqual("ACTION", started["kind"])
+        self.assertEqual(2, provider.calls)
+        events = service.store.recent_job_events("job-1", 16)
+        faults = [event for event in events if event["type"] == "planner_error"]
+        self.assertEqual(1, len(faults))
+        self.assertIn("provider is busy", faults[0]["payload"]["reason"])
+
+    def test_persistent_provider_failure_pauses_after_bounded_retries(self) -> None:
+        class DownProvider:
+            def __init__(self) -> None:
+                self.calls = 0
+
+            def chat(self, messages: object, tools: object) -> ProviderReply:
+                self.calls += 1
+                raise ProviderError("provider request failed")
+
+        provider = DownProvider()
+        service = self.service(provider)  # type: ignore[arg-type]
+        paused = service.start(job_payload())
+        self.assertEqual("PAUSED", paused["kind"])
+        self.assertIn("provider request failed", paused["reason"])
+        self.assertEqual(3, provider.calls)
+        stored = service.store.get_job("job-1")
+        assert stored is not None
+        self.assertEqual("PAUSED", stored.state)
+
+    def test_planner_retries_can_be_disabled_for_fail_fast(self) -> None:
+        prose = ProviderReply(
+            content="done",
+            assistant_message={"role": "assistant", "content": "done"},
+            tool_calls=(),
+        )
+        provider = FakeProvider(prose)
+        service = self.service(provider, CITIZENS_MAX_JOB_PLANNER_RETRIES="0")
+        paused = service.start(job_payload())
+        self.assertEqual("PAUSED", paused["kind"])
+        self.assertIn("exactly one", paused["reason"])
+        self.assertEqual(1, len(provider.calls))
+
+    def test_unavailable_world_tool_is_retried_with_feedback(self) -> None:
+        provider = FakeProvider(
+            reply("break_block", {"x": 1}),
+            reply("look_around", {}),
+        )
+        service = self.service(provider)
+        started = service.start(job_payload())
+        self.assertEqual("ACTION", started["kind"])
+        self.assertEqual("look_around", started["action"]["name"])
+        feedback = json.dumps(provider.calls[-1][0], ensure_ascii=False)
+        self.assertIn("unavailable world tool", feedback)
 
     def test_tool_free_and_parallel_provider_replies_pause_safely(self) -> None:
         no_call = ProviderReply(
@@ -379,29 +493,30 @@ class DurableJobTest(TempDatabaseTest, unittest.TestCase):
             assistant_message={"role": "assistant", "content": "done"},
             tool_calls=(),
         )
-        service = self.service(FakeProvider(no_call))
+        service = self.service(FakeProvider(no_call, no_call, no_call))
         paused = service.start(job_payload())
         self.assertEqual("PAUSED", paused["kind"])
         self.assertIn("exactly one", paused["reason"])
 
         second_path = self.db_path + ".parallel"
         configured = settings(second_path)
-        parallel = FakeProvider(
-            ProviderReply(
-                content="",
-                assistant_message={"role": "assistant", "content": ""},
-                tool_calls=(
-                    ProviderToolCall("look_around", {}),
-                    ProviderToolCall("mine", {"count": 1}),
-                ),
-            )
+        parallel_call = ProviderReply(
+            content="",
+            assistant_message={"role": "assistant", "content": ""},
+            tool_calls=(
+                ProviderToolCall("look_around", {}),
+                ProviderToolCall("mine", {"count": 1}),
+            ),
         )
+        parallel = FakeProvider(parallel_call, parallel_call, parallel_call)
         parallel_service = JobService(
             settings=configured,
             store=SQLiteStore(configured.db_path),
             provider=parallel,
         )
-        self.assertEqual("PAUSED", parallel_service.start(job_payload(job_id="job-2"))["kind"])
+        paused_parallel = parallel_service.start(job_payload(job_id="job-2"))
+        self.assertEqual("PAUSED", paused_parallel["kind"])
+        self.assertIn("exactly one", paused_parallel["reason"])
 
     def test_pause_cancel_status_and_list_use_bounded_flow_projection(self) -> None:
         secret_goal = "sort chests SECRET-GOAL-CONTENT"

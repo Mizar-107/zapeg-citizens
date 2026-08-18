@@ -1172,6 +1172,49 @@ class SQLiteStore:
         finally:
             connection.close()
 
+    def record_job_planner_error(
+        self,
+        *,
+        job_id: str,
+        reason: str,
+        now: float,
+    ) -> JobRecord:
+        """Journal one bounded planner fault and return the job to READY.
+
+        The event is part of the model-visible recent-event window, so the next
+        planning call can see and correct the rejected reply instead of the job
+        pausing on a single transient or malformed planner response.
+        """
+        connection = self._connect()
+        try:
+            connection.execute("BEGIN IMMEDIATE")
+            row = self._job_row(connection, job_id)
+            if row["state"] != "CALLING":
+                raise StoreError(f"job_{row['state'].lower()}")
+            connection.execute(
+                """
+                INSERT INTO job_events(job_id, event_type, payload_json, created_at)
+                VALUES (?, 'planner_error', ?, ?)
+                """,
+                (job_id, self._dump({"reason": reason}), now),
+            )
+            connection.execute(
+                """
+                UPDATE jobs SET state = 'READY', revision = revision + 1,
+                                updated_at = ?
+                 WHERE job_id = ?
+                """,
+                (now, job_id),
+            )
+            updated = self._job_row(connection, job_id)
+            connection.commit()
+            return self._job_record(updated)
+        except BaseException:
+            connection.rollback()
+            raise
+        finally:
+            connection.close()
+
     def save_job_checkpoint(
         self,
         *,

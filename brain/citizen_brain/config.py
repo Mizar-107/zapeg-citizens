@@ -84,6 +84,7 @@ class Settings:
     max_job_checkpoint_chars: int
     max_job_recent_events: int
     max_job_internal_steps: int
+    max_job_planner_retries: int
 
     @classmethod
     def from_env(cls, env: Mapping[str, str] | None = None) -> "Settings":
@@ -164,5 +165,8 @@ class Settings:
             ),
             max_job_internal_steps=_integer(
                 values, "CITIZENS_MAX_JOB_INTERNAL_STEPS", 8, 1, 32
+            ),
+            max_job_planner_retries=_integer(
+                values, "CITIZENS_MAX_JOB_PLANNER_RETRIES", 2, 0, 8
             ),
         )
