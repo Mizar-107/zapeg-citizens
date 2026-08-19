@@ -629,13 +629,15 @@ public final class CitizenJobManager {
         nextAutoResumeAt.put(job.jobId(), now + AUTO_RESUME_DEBOUNCE_TICKS);
         autoResumeAttempts.put(job.jobId(), attempts + 1);
         String change = describeInventoryChange(baseline, current);
+        String answer = "The citizen's inventory changed while paused: " + change + ".";
+        if (HarvestPolicy.isOptionalHarvestToolRequest(job.goal(), job.message().orElse(""))
+                || HarvestPolicy.describesAxeSupply(change)) {
+            answer = answer + " " + HarvestPolicy.handHarvestAnswer();
+        }
         ZapeGCitizens.LOGGER.info(
                 "[citizen-job] auto-resume attempt job={} attempt={} change={}",
                 job.jobId(), attempts + 1, change);
-        JobOperation operation = resume(
-                server,
-                job.jobId(),
-                "The citizen's inventory changed while paused: " + change + ".");
+        JobOperation operation = resume(server, job.jobId(), answer);
         if (operation.successful()) {
             tellActor(server, job, "[" + citizenName(server, job.citizenId())
                     + "] Got new supplies (" + change + ") — continuing.");
@@ -930,8 +932,19 @@ public final class CitizenJobManager {
 
         switch (reply.kind()) {
             case ACTION -> dispatchAction(server, job, progress, reply.action().orElseThrow());
-            case NEEDS_INPUT -> needsInput(
-                    server, job, progress, reply.question().orElseThrow());
+            case NEEDS_INPUT -> {
+                String question = reply.question().orElseThrow();
+                boolean optionalTool = HarvestPolicy.isOptionalHarvestToolRequest(
+                        job.goal(), question);
+                needsInput(server, job, progress, question, !optionalTool);
+                if (optionalTool) {
+                    JobOperation operation = resume(
+                            server, job.jobId(), HarvestPolicy.handHarvestAnswer());
+                    if (!operation.successful()) {
+                        tellActor(server, job, "[Citizens] " + operation.message());
+                    }
+                }
+            }
             case COMPLETED -> complete(
                     server, job, progress, reply.speech().orElseThrow());
             case PAUSED -> {
@@ -1089,6 +1102,15 @@ public final class CitizenJobManager {
 
     private void needsInput(
             MinecraftServer server, JobRecord job, JobProgress progress, String question) {
+        needsInput(server, job, progress, question, true);
+    }
+
+    private void needsInput(
+            MinecraftServer server,
+            JobRecord job,
+            JobProgress progress,
+            String question,
+            boolean announce) {
         long now = server.overworld().getGameTime();
         CitizenJobData.get(server).update(job.jobId(), current -> current.transition(
                 JobState.NEEDS_INPUT,
@@ -1112,8 +1134,10 @@ public final class CitizenJobManager {
         } else {
             needsInputInventoryBaseline.remove(job.jobId());
         }
-        // The citizen speaks for itself when it needs something, matching completion speech.
-        tellActor(server, job, "[" + citizenName(server, job.citizenId()) + "] " + question);
+        if (announce) {
+            // The citizen speaks for itself when it needs something, matching completion speech.
+            tellActor(server, job, "[" + citizenName(server, job.citizenId()) + "] " + question);
+        }
     }
 
     private void complete(

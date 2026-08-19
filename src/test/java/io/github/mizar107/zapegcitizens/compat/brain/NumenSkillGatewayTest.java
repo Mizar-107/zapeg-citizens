@@ -41,6 +41,8 @@ final class NumenSkillGatewayTest {
         assertEquals("mining", result.getAsJsonObject("data").get("name").getAsString());
         assertTrue(result.getAsJsonObject("data").get("workflow").getAsString()
                 .contains("deepslate_diamond_ore"));
+        assertTrue(result.getAsJsonObject("data").get("workflow").getAsString()
+                .contains("punching with empty hands"));
     }
 
     @Test

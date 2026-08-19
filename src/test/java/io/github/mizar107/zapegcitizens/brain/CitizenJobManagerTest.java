@@ -196,6 +196,26 @@ class CitizenJobManagerTest {
         assertFalse(CitizenJobManager.shouldAttemptAutoResume(-1));
     }
 
+    @Test
+    void woodGatheringDoesNotRequireAnAxe() {
+        assertTrue(HarvestPolicy.isOptionalHarvestToolRequest(
+                "Go chop some wood.",
+                "I need an axe in my inventory before I can chop wood."));
+        assertTrue(HarvestPolicy.isOptionalHarvestToolRequest(
+                "Gather oak logs",
+                "Please give me a diamond axe."));
+        assertFalse(HarvestPolicy.isOptionalHarvestToolRequest(
+                "Mine five diamonds.",
+                "I need an iron pickaxe before I can mine diamond ore."));
+        assertFalse(HarvestPolicy.isOptionalHarvestToolRequest(
+                "Build a villa here.",
+                "I need 64 cobblestone in my inventory."));
+        assertTrue(HarvestPolicy.handHarvestAnswer().toLowerCase().contains("punched"));
+        assertTrue(HarvestPolicy.describesAxeSupply("+1x minecraft:iron_axe"));
+        assertTrue(HarvestPolicy.describesAxeSupply("+1x mekanismtools:steel_axe"));
+        assertFalse(HarvestPolicy.describesAxeSupply("+1x minecraft:stick"));
+    }
+
     private static JobRecord baseJob(JobState state, JobProgress progress) {
         return new JobRecord(
                 UUID.randomUUID(),

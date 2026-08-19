@@ -253,15 +253,15 @@ class DurableJobTest(TempDatabaseTest, unittest.TestCase):
         self.assertIn("Use spruce with a stone foundation.", context)
 
     def test_resume_after_needs_input_dispatches_an_ordered_batch(self) -> None:
-        # The wood-chopping regression: a requirement pause must resume into real
-        # work, and the planner may verify and act in one ordered batch.
+        # A real requirement pause must resume into world work, and the planner
+        # may verify and act in one ordered batch. Wood+axe is not a valid pause.
         provider = FakeProvider(
             reply(
                 "job_needs_input",
                 {
-                    "phase": "tools",
-                    "summary": "An axe is required.",
-                    "question": "I need an axe in my inventory before I can chop wood.",
+                    "phase": "choice",
+                    "summary": "A log type is required.",
+                    "question": "Which logs should I gather, oak or birch?",
                 },
             ),
             ProviderReply(
@@ -290,14 +290,93 @@ class DurableJobTest(TempDatabaseTest, unittest.TestCase):
         context = json.dumps(provider.calls[-1][0], ensure_ascii=False)
         self.assertIn("inventory changed", context)
 
-        # The queued chop dispatches right after the verification succeeds.
         chopping = service.result(
             result_payload(
                 "verify-axe", "job-1", resumed["action"]["id"], {"success": True}
             )
         )
         self.assertEqual("mine", chopping["action"]["name"])
+        self.assertEqual(["minecraft:oak_log"], chopping["action"]["arguments"]["block_ids"])
         self.assertEqual(2, len(provider.calls))
+
+    def test_wood_gathering_rejects_an_axe_requirement_and_mines(self) -> None:
+        provider = FakeProvider(
+            reply(
+                "job_needs_input",
+                {
+                    "phase": "tools",
+                    "summary": "An axe is required.",
+                    "question": "I need an axe in my inventory before I can chop wood.",
+                },
+            ),
+            ProviderReply(
+                content="",
+                assistant_message={"role": "assistant", "content": ""},
+                tool_calls=(
+                    ProviderToolCall(
+                        "mine", {"block_ids": ["minecraft:oak_log"], "count": 8}
+                    ),
+                ),
+            ),
+        )
+        service = self.service(provider)
+        started = service.start(job_payload(goal="Go chop some wood."))
+        self.assertEqual("ACTION", started["kind"])
+        self.assertEqual("mine", started["action"]["name"])
+        self.assertEqual(["minecraft:oak_log"], started["action"]["arguments"]["block_ids"])
+        self.assertEqual(2, len(provider.calls))
+        feedback = json.dumps(provider.calls[-1][0], ensure_ascii=False)
+        self.assertIn("planner_error", feedback)
+        self.assertIn("hand-breakable", feedback)
+
+    def test_giving_an_axe_cannot_reblock_wood_and_must_mine(self) -> None:
+        provider = FakeProvider(
+            reply(
+                "job_needs_input",
+                {
+                    "phase": "choice",
+                    "summary": "A log type is required.",
+                    "question": "Which logs should I gather, oak or birch?",
+                },
+            ),
+            reply(
+                "job_needs_input",
+                {
+                    "phase": "tools",
+                    "summary": "An axe is required.",
+                    "question": "Thanks, I still need an axe before I chop.",
+                },
+            ),
+            reply("mine", {"block_ids": ["minecraft:birch_log"], "count": 4}),
+        )
+        service = self.service(provider)
+        blocked = service.start(job_payload(goal="Gather birch wood."))
+        self.assertEqual("NEEDS_INPUT", blocked["kind"])
+        chopping = service.resume(
+            resume_payload(
+                "resume-after-axe",
+                "job-1",
+                answer="The citizen's inventory changed while paused: +1x minecraft:iron_axe.",
+            )
+        )
+        self.assertEqual("ACTION", chopping["kind"])
+        self.assertEqual("mine", chopping["action"]["name"])
+        self.assertEqual(["minecraft:birch_log"], chopping["action"]["arguments"]["block_ids"])
+
+    def test_planner_is_told_wood_can_be_punched(self) -> None:
+        provider = FakeProvider(reply("mine", {"block_ids": ["minecraft:oak_log"], "count": 4}))
+        service = self.service(provider)
+        started = service.start(job_payload(goal="Go chop some wood."))
+        self.assertEqual("mine", started["action"]["name"])
+        system = provider.calls[0][0][0]["content"]
+        self.assertIn("hand-breakable blocks can be punched", system)
+        self.assertIn("never pause for an axe", system)
+        offered = {tool["function"]["name"] for tool in provider.calls[0][1]}
+        self.assertIn("mine", offered)
+        needs_input = next(
+            tool for tool in provider.calls[0][1] if tool["function"]["name"] == "job_needs_input"
+        )
+        self.assertIn("Never use this for an axe", needs_input["function"]["description"])
 
     def test_planner_is_told_dimension_travel_is_unavailable(self) -> None:
         provider = FakeProvider(reply("look_around", {}))

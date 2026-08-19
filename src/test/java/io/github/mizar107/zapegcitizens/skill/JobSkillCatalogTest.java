@@ -21,6 +21,8 @@ final class JobSkillCatalogTest {
         assertTrue(JobSkillCatalog.require("storage").contains("exact item stacks"));
         assertTrue(JobSkillCatalog.require("building").contains("Plan before mutation"));
         assertTrue(JobSkillCatalog.require("mining").contains("diamond_ore"));
+        assertTrue(JobSkillCatalog.require("mining").contains("punching with empty hands"));
+        assertTrue(JobSkillCatalog.require("mining").contains("never pause"));
         assertTrue(JobSkillCatalog.require("combat").contains("confirmed target deaths"));
     }
 

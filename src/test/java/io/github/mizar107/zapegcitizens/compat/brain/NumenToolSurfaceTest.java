@@ -31,6 +31,8 @@ final class NumenToolSurfaceTest {
         assertFalse(description.contains("place_block"));
         assertTrue(description.contains("interact_at"));
         assertTrue(description.contains("transfer"));
+        assertTrue(description.contains("punched"));
+        assertTrue(description.contains("never a blocker"));
 
         String raw = """
                 {"success":false,"message":"try place_block",\

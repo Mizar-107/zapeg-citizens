@@ -2,8 +2,12 @@
 
 Use this workflow for gathering ores, stone, logs, or other mineable blocks.
 
-1. Call `get_self_status`. Confirm dimension, health, food, free inventory slots and a tool capable of
-   harvesting the requested block. Equip the correct tool before committing to a long trip.
+1. Call `get_self_status`. Confirm dimension, health, food, and free inventory slots.
+   Logs, wood, leaves, dirt, sand, gravel, and similar vanilla hand-breakable blocks do **not**
+   require a tool: punching with empty hands is valid and expected. Call `mine` immediately.
+   An axe, shovel, or shears is optional speed only. Equip one if it is already in inventory;
+   never pause the job to ask the owner for it. A pickaxe **is** required for stone and ore;
+   only then is a missing tool a real blocker.
 2. Translate the resource into every relevant exact block id. For diamonds this normally means both
    `minecraft:diamond_ore` and `minecraft:deepslate_diamond_ore`. The `mine.count` value is NEW items
    to gain above the starting inventory, not blocks to break; Fortune can make the result exceed it.

@@ -26,6 +26,12 @@ final class NumenToolSurface {
                     "Load the building_design skill (load_skill) BEFORE designing anything non-trivial.",
                     "Call load_skill with name=building BEFORE designing anything non-trivial.");
         }
+        if ("mine".equals(toolName)) {
+            truthful = truthful
+                    + " Logs, wood, and other vanilla hand-breakable blocks can be punched with "
+                    + "empty hands. An axe is optional speed, never a blocker. Equip an axe only "
+                    + "when one is already in inventory, then mine.";
+        }
         return truthful;
     }
 
