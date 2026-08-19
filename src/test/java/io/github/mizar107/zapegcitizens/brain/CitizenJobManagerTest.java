@@ -7,9 +7,12 @@ import io.github.mizar107.zapegcitizens.data.CitizenJobData.JobRecord;
 import io.github.mizar107.zapegcitizens.data.CitizenJobData.JobState;
 import org.junit.jupiter.api.Test;
 
+import java.util.Map;
 import java.util.Optional;
+import java.util.TreeMap;
 import java.util.UUID;
 
+import static org.junit.jupiter.api.Assertions.assertEquals;
 import static org.junit.jupiter.api.Assertions.assertFalse;
 import static org.junit.jupiter.api.Assertions.assertTrue;
 
@@ -155,6 +158,42 @@ class CitizenJobManagerTest {
         assertTrue(CitizenJobManager.brainRetryDelayTicks(5) == 1_200L);
         // A pathological attempt index can never overflow into a negative delay.
         assertTrue(CitizenJobManager.brainRetryDelayTicks(40) == 1_200L);
+    }
+
+    @Test
+    void inventoryChangeDescriptionIsSignedCompleteAndBounded() {
+        Map<String, Integer> baseline = Map.of(
+                "minecraft:oak_log", 3,
+                "minecraft:stick", 8);
+        Map<String, Integer> current = Map.of(
+                "minecraft:oak_log", 1,
+                "minecraft:iron_axe", 1);
+
+        assertEquals(
+                "+1x minecraft:iron_axe, -2x minecraft:oak_log, -8x minecraft:stick",
+                CitizenJobManager.describeInventoryChange(baseline, current));
+        assertEquals(
+                "items moved",
+                CitizenJobManager.describeInventoryChange(baseline, baseline));
+
+        // A pathologically large inventory can never produce an unbounded chat message.
+        Map<String, Integer> empty = Map.of();
+        Map<String, Integer> huge = new TreeMap<>();
+        for (int index = 0; index < 500; index++) {
+            huge.put("minecraft:item_" + String.format("%03d", index), index);
+        }
+        String described = CitizenJobManager.describeInventoryChange(empty, huge);
+        assertTrue(described.length() < 320, "diff must stay bounded");
+        assertTrue(described.endsWith("..."), "truncated diff must be marked");
+    }
+
+    @Test
+    void autoResumeAttemptsAreBounded() {
+        assertTrue(CitizenJobManager.shouldAttemptAutoResume(0));
+        assertTrue(CitizenJobManager.shouldAttemptAutoResume(3));
+        assertFalse(CitizenJobManager.shouldAttemptAutoResume(4));
+        assertFalse(CitizenJobManager.shouldAttemptAutoResume(7));
+        assertFalse(CitizenJobManager.shouldAttemptAutoResume(-1));
     }
 
     private static JobRecord baseJob(JobState state, JobProgress progress) {

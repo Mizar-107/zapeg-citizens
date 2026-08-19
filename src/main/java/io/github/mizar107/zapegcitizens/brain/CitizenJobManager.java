@@ -19,9 +19,12 @@ import io.github.mizar107.zapegcitizens.data.CitizenJobData.PendingAction;
 import io.github.mizar107.zapegcitizens.data.CitizenRegistryData;
 import io.github.mizar107.zapegcitizens.data.CitizenRegistryData.CitizenRecord;
 import io.github.mizar107.zapegcitizens.data.CitizenRegistryData.OwnerKind;
+import net.minecraft.core.registries.BuiltInRegistries;
 import net.minecraft.network.chat.Component;
 import net.minecraft.server.MinecraftServer;
 import net.minecraft.server.level.ServerPlayer;
+import net.minecraft.world.entity.player.Inventory;
+import net.minecraft.world.item.ItemStack;
 
 import java.nio.charset.StandardCharsets;
 import java.util.List;
@@ -29,6 +32,8 @@ import java.util.Locale;
 import java.util.Map;
 import java.util.Optional;
 import java.util.Set;
+import java.util.TreeMap;
+import java.util.TreeSet;
 import java.util.UUID;
 import java.util.concurrent.CompletableFuture;
 import java.util.concurrent.CompletionException;
@@ -49,6 +54,9 @@ public final class CitizenJobManager {
     private static final long BRAIN_RETRY_BASE_TICKS = 100L;
     private static final long BRAIN_RETRY_MAX_TICKS = 1_200L;
     private static final int BRAIN_RETRY_MAX_ATTEMPTS = 6;
+    private static final long AUTO_RESUME_DEBOUNCE_TICKS = 200L;
+    private static final int AUTO_RESUME_MAX_ATTEMPTS = 4;
+    private static final int MAX_INVENTORY_DIFF_LENGTH = 240;
     private static final Set<String> READ_ONLY_TOOLS = Set.of(
             "get_self_status",
             "get_owner_status",
@@ -79,6 +87,16 @@ public final class CitizenJobManager {
     private final Map<UUID, Long> nextBrainRetryAt = new ConcurrentHashMap<>();
     private final Map<UUID, Integer> brainRetryAttempts = new ConcurrentHashMap<>();
     private final Set<UUID> brainPauseNotified = ConcurrentHashMap.newKeySet();
+    /**
+     * Runtime-only auto-resume bookkeeping for NEEDS_INPUT jobs: the inventory snapshot taken
+     * when the requirement was declared, plus debounce and bounded-attempt state. None of this
+     * is persisted; after a restart the first tick simply re-baselines the snapshot.
+     */
+    private final Map<UUID, Map<String, Integer>> needsInputInventoryBaseline =
+            new ConcurrentHashMap<>();
+    private final Map<UUID, Long> nextAutoResumeAt = new ConcurrentHashMap<>();
+    private final Map<UUID, Integer> autoResumeAttempts = new ConcurrentHashMap<>();
+    private final Set<UUID> autoResumeExhaustedNotified = ConcurrentHashMap.newKeySet();
 
     private MinecraftServer attachedServer;
     private long lastBudgetAccountAt;
@@ -548,14 +566,138 @@ public final class CitizenJobManager {
                 nextBrainRetryAt.remove(job.jobId());
                 brainRetryAttempts.remove(job.jobId());
                 brainPauseNotified.remove(job.jobId());
+                needsInputInventoryBaseline.remove(job.jobId());
+                nextAutoResumeAt.remove(job.jobId());
+                autoResumeAttempts.remove(job.jobId());
+                autoResumeExhaustedNotified.remove(job.jobId());
                 continue;
             }
             if (job.state() == JobState.PAUSED_BODY || job.state() == JobState.PAUSED_OWNER) {
                 resumeEligible(server, job.citizenId());
             } else if (job.state() == JobState.PAUSED_BRAIN) {
                 maybeRetryBrain(server, job, now);
+            } else if (job.state() == JobState.NEEDS_INPUT) {
+                maybeAutoResume(server, job, now);
             }
         }
+    }
+
+    /**
+     * A job paused for a requirement never notices on its own that the requirement was
+     * supplied. While the job sits in NEEDS_INPUT, watch the citizen body's inventory and,
+     * when its contents change, resume once with a server-authenticated description of the
+     * change as the answer so the planner can verify and continue. Debounced and bounded:
+     * after a few unanswered attempts the job waits for a manual answer instead.
+     */
+    private void maybeAutoResume(MinecraftServer server, JobRecord job, long now) {
+        if (http == null || inFlight.containsKey(job.jobId())) {
+            return;
+        }
+        int attempts = autoResumeAttempts.getOrDefault(job.jobId(), 0);
+        if (!shouldAttemptAutoResume(attempts)) {
+            if (autoResumeExhaustedNotified.add(job.jobId())) {
+                tellActor(server, job, "[Citizens] " + citizenName(server, job.citizenId())
+                        + " still needs an answer for job " + shortId(job.jobId())
+                        + ": " + job.message().orElse("requirement unmet")
+                        + " Reply with " + answerHint(server, job) + ".");
+            }
+            return;
+        }
+        if (now < nextAutoResumeAt.getOrDefault(job.jobId(), 0L)) {
+            return;
+        }
+        CitizenRecord citizenRecord = CitizenRegistryData.get(server)
+                .findByCitizenId(job.citizenId()).orElse(null);
+        if (citizenRecord == null || !canRun(server, citizenRecord)) {
+            return;
+        }
+        NumenPlayer body = NumenServerCompat.findLiveManaged(
+                server, citizenRecord.citizenId(), citizenRecord.bodyOwnerId());
+        if (body == null) {
+            return;
+        }
+        Map<String, Integer> current = inventorySnapshot(body);
+        Map<String, Integer> baseline = needsInputInventoryBaseline.get(job.jobId());
+        if (baseline == null) {
+            needsInputInventoryBaseline.put(job.jobId(), current);
+            return;
+        }
+        if (baseline.equals(current)) {
+            return;
+        }
+        needsInputInventoryBaseline.put(job.jobId(), current);
+        nextAutoResumeAt.put(job.jobId(), now + AUTO_RESUME_DEBOUNCE_TICKS);
+        autoResumeAttempts.put(job.jobId(), attempts + 1);
+        String change = describeInventoryChange(baseline, current);
+        ZapeGCitizens.LOGGER.info(
+                "[citizen-job] auto-resume attempt job={} attempt={} change={}",
+                job.jobId(), attempts + 1, change);
+        JobOperation operation = resume(
+                server,
+                job.jobId(),
+                "The citizen's inventory changed while paused: " + change + ".");
+        if (operation.successful()) {
+            tellActor(server, job, "[" + citizenName(server, job.citizenId())
+                    + "] Got new supplies (" + change + ") — continuing.");
+        } else {
+            ZapeGCitizens.LOGGER.debug(
+                    "[citizen-job] auto-resume deferred job={} reason={}",
+                    job.jobId(), operation.message());
+        }
+    }
+
+    private static String answerHint(MinecraftServer server, JobRecord job) {
+        String name = citizenName(server, job.citizenId());
+        boolean serverOwned = CitizenRegistryData.get(server).findByCitizenId(job.citizenId())
+                .map(record -> record.logicalOwner().kind() == OwnerKind.SERVER)
+                .orElse(false);
+        return serverOwned
+                ? "/citizen resume " + name + " <answer>"
+                : "@" + name + " answer <your answer>";
+    }
+
+    /** Item counts by registry name across the whole body inventory; NBT is ignored. */
+    private static Map<String, Integer> inventorySnapshot(NumenPlayer body) {
+        Map<String, Integer> counts = new TreeMap<>();
+        Inventory inventory = body.getInventory();
+        for (int slot = 0; slot < inventory.getContainerSize(); slot++) {
+            ItemStack stack = inventory.getItem(slot);
+            if (stack.isEmpty()) {
+                continue;
+            }
+            counts.merge(
+                    BuiltInRegistries.ITEM.getKey(stack.getItem()).toString(),
+                    stack.getCount(),
+                    Integer::sum);
+        }
+        return counts;
+    }
+
+    /** Bounded signed diff of two inventory snapshots, e.g. "+1x minecraft:iron_axe". */
+    static String describeInventoryChange(
+            Map<String, Integer> baseline, Map<String, Integer> current) {
+        Set<String> keys = new TreeSet<>(baseline.keySet());
+        keys.addAll(current.keySet());
+        StringBuilder text = new StringBuilder();
+        for (String key : keys) {
+            int delta = current.getOrDefault(key, 0) - baseline.getOrDefault(key, 0);
+            if (delta == 0) {
+                continue;
+            }
+            if (text.length() > 0) {
+                text.append(", ");
+            }
+            text.append(delta > 0 ? "+" : "").append(delta).append("x ").append(key);
+            if (text.length() >= MAX_INVENTORY_DIFF_LENGTH) {
+                text.append("...");
+                break;
+            }
+        }
+        return text.length() == 0 ? "items moved" : text.toString();
+    }
+
+    static boolean shouldAttemptAutoResume(int attempts) {
+        return attempts >= 0 && attempts < AUTO_RESUME_MAX_ATTEMPTS;
     }
 
     /**
@@ -605,6 +747,10 @@ public final class CitizenJobManager {
         nextBrainRetryAt.clear();
         brainRetryAttempts.clear();
         brainPauseNotified.clear();
+        needsInputInventoryBaseline.clear();
+        nextAutoResumeAt.clear();
+        autoResumeAttempts.clear();
+        autoResumeExhaustedNotified.clear();
         attachedServer = null;
     }
 
@@ -892,6 +1038,10 @@ public final class CitizenJobManager {
                 "[citizen-job] action job={} citizen={} index={} tool={} read_only={}",
                 job.jobId(), job.citizenId(), job.actionsCompleted() + 1,
                 action.name(), pending.readOnly());
+        // Real progress re-arms the auto-resume budget for the next requirement pause.
+        autoResumeAttempts.remove(job.jobId());
+        autoResumeExhaustedNotified.remove(job.jobId());
+        nextAutoResumeAt.remove(job.jobId());
         NumenToolGateway.execute(
                 body,
                 executionId,
@@ -949,6 +1099,19 @@ public final class CitizenJobManager {
                 current.lastConfirmedActionId(),
                 Optional.of(question),
                 now));
+        // Re-baseline the inventory watch so the auto-resume reacts to what arrives
+        // after this requirement was declared, not to earlier contents.
+        CitizenRecord citizenRecord = CitizenRegistryData.get(server)
+                .findByCitizenId(job.citizenId()).orElse(null);
+        NumenPlayer body = citizenRecord == null
+                ? null
+                : NumenServerCompat.findLiveManaged(
+                        server, citizenRecord.citizenId(), citizenRecord.bodyOwnerId());
+        if (body != null) {
+            needsInputInventoryBaseline.put(job.jobId(), inventorySnapshot(body));
+        } else {
+            needsInputInventoryBaseline.remove(job.jobId());
+        }
         // The citizen speaks for itself when it needs something, matching completion speech.
         tellActor(server, job, "[" + citizenName(server, job.citizenId()) + "] " + question);
     }
@@ -1254,6 +1417,10 @@ public final class CitizenJobManager {
             nextBrainRetryAt.clear();
             brainRetryAttempts.clear();
             brainPauseNotified.clear();
+            needsInputInventoryBaseline.clear();
+            nextAutoResumeAt.clear();
+            autoResumeAttempts.clear();
+            autoResumeExhaustedNotified.clear();
         }
     }
 

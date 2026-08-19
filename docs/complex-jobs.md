@@ -31,16 +31,30 @@ operator answers a server-owned job with `/citizen resume <name> <answer>`. Serv
 dialogue remains a separate lane, so players may continue talking to the character while its body
 performs an operator job.
 
+A requirement pause also watches the citizen's hands. While a job waits in `NEEDS_INPUT`, the mod
+periodically diffs the body inventory against the snapshot taken when the requirement was declared.
+When the contents change — the owner tosses over an axe, for instance — the job resumes itself once
+with a server-authenticated description of the change as the answer, says so in chat
+(“Got new supplies (+1x minecraft:iron_axe) — continuing.”), and the planner verifies the
+requirement with read-only tools before spending more actions. Auto-resume is debounced and bounded
+to four attempts per requirement; after that the job waits for a manual answer and reminds the owner
+how to give one. A fresh requirement after real progress re-arms the budget.
+
 At submission, the mod records the actor's dimension, position, rotation, and looked-at block.
 Words such as “here,” “this plot,” and “these chests” therefore have a stable server-authenticated
 anchor even when the citizen's technical Numen owner is not a real player.
 
 ## Planning and recovery
 
-The brain first persists a bounded plan and completion criteria. It then returns exactly one
+The brain first persists a bounded plan and completion criteria. A planner reply may then carry one
+physical action or a short ordered batch of up to eight; the brain validates every element
+fail-closed, persists the remainder as the job's action queue, and still releases exactly one
 physical action at a time. Minecraft writes and synchronously asks its `SavedData` store to save the
 pending action before calling Numen, and the brain commits it to SQLite before returning it to
-Minecraft. Results are journaled under stable action IDs and result requests are idempotent.
+Minecraft. While a queued batch keeps succeeding, each confirmed result releases the next queued
+action without another model call; a failure discards the rest of the queue and the planner
+re-plans from the fresh observation. Results are journaled under stable action IDs and result
+requests are idempotent.
 
 The planner knows its hard capability limits and says so instead of stalling. Movement and every
 world tool act only on foot within the citizen's current dimension; there is no portal, teleport, or
