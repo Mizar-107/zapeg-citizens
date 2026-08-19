@@ -64,7 +64,20 @@ class SQLiteMigrationTest(TempDatabaseTest, unittest.TestCase):
         self.assertEqual("failed", states["turn-new"])
         self.assertNotIn("one_active_turn_per_session", indexes)
         self.assertIn("one_active_turn_per_citizen", indexes)
-        self.assertEqual(4, version)
+        self.assertEqual(5, version)
+
+    def test_pre_batch_jobs_table_gains_the_action_queue_column(self) -> None:
+        SQLiteStore(self.db_path)
+        with closing(sqlite3.connect(self.db_path)) as connection:
+            connection.execute("ALTER TABLE jobs DROP COLUMN action_queue_json")
+            connection.commit()
+
+        SQLiteStore(self.db_path)
+        with closing(sqlite3.connect(self.db_path)) as connection:
+            columns = {
+                row[1] for row in connection.execute("PRAGMA table_info(jobs)")
+            }
+        self.assertIn("action_queue_json", columns)
 
     def test_reopen_fails_calling_turn_but_preserves_waiting_tool_turn(self) -> None:
         SQLiteStore(self.db_path)

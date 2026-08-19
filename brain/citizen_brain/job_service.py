@@ -13,7 +13,13 @@ from uuid import uuid4
 from .config import Settings
 from .provider import ChatProvider, ProviderError, ProviderReply, ProviderToolCall
 from .service import ApiError, BrainService, PROTOCOL_VERSION
-from .storage import JobOperationTransition, JobRecord, SQLiteStore, StoreError
+from .storage import (
+    JobOperationTransition,
+    JobRecord,
+    SQLiteStore,
+    StoreError,
+    _successful_tool_result,
+)
 
 
 _ID = re.compile(r"^[A-Za-z0-9][A-Za-z0-9_.:@-]{0,127}$")
@@ -22,6 +28,10 @@ _PHASE_CHARS = 128
 _REASON_CHARS = 512
 _MAX_PLAN_STEPS = 24
 _MAX_EVIDENCE = 128
+# A planner reply may carry one internal job tool, or an ordered batch of world
+# actions executed one persisted action at a time. The bound keeps a runaway
+# model from pre-committing a job to a long blind sequence.
+_MAX_ACTION_BATCH = 8
 
 # These Numen calls observe state without intentionally changing the world. During
 # crash recovery the model receives only this subset until one observation result
@@ -235,10 +245,56 @@ class JobService:
             # executable response after pause/cancel/another action changed state.
             return self._project(transition.job)
         if transition.job.state == "READY":
-            response = self._advance(transition.job)
+            response = self._after_confirmed_result(transition.job, result_content)
         else:
             response = self._project(transition.job)
         self._cache(request_id, response)
+        return response
+
+    def _after_confirmed_result(
+        self, job: JobRecord, result_content: str
+    ) -> dict[str, Any]:
+        """Continue a job after a confirmed action result.
+
+        A queued planner batch keeps executing one persisted action at a time
+        without new model calls, but only while every result succeeds: a failed
+        action discards the remainder (and, for a failed mutation, the recovery
+        rule already restricts the next planning step to read-only observation),
+        so the planner re-plans from the confirmed world state instead of blindly
+        executing a stale sequence.
+        """
+        if job.action_queue and not _successful_tool_result(result_content):
+            job = self.store.clear_job_action_queue(
+                job_id=job.job_id,
+                reason="the previous action failed; the remaining queued actions "
+                "were discarded and the planner was re-asked",
+                now=self._clock(),
+            )
+        if not job.action_queue:
+            return self._advance(job)
+        if job.actions_completed >= job.budgets["max_actions"]:
+            job = self.store.clear_job_action_queue(
+                job_id=job.job_id,
+                reason="the action budget was exhausted; the remaining queued "
+                "actions were discarded",
+                now=self._clock(),
+            )
+            return self._pause_internal(job, "action budget exhausted")
+        head = job.action_queue[0]
+        next_action = {
+            "id": head["id"],
+            "name": head["name"],
+            "arguments": head["arguments"],
+        }
+        response = self._action_flow(job, next_action)
+        try:
+            self.store.pop_job_action_queue(
+                job_id=job.job_id,
+                response=response,
+                now=self._clock(),
+            )
+        except StoreError as exc:
+            raise self._store_error(exc) from exc
         return response
 
     def resume(self, payload: Any) -> dict[str, Any]:
@@ -403,12 +459,12 @@ class JobService:
                 raise self._store_error(exc) from exc
 
             fault: str | None = None
-            call: ProviderToolCall | None = None
+            calls: list[ProviderToolCall] | None = None
             try:
                 messages = self._messages(calling)
                 provider_tools = self._provider_tools(calling)
                 reply = self.provider.chat(messages, provider_tools)
-                call = self._one_call(reply)
+                calls = self._calls(reply)
             except ApiError as exc:
                 # Context-size and protocol rejections cannot be fixed by re-asking.
                 return self._pause_internal(calling, self._bounded(exc.message, _REASON_CHARS))
@@ -417,9 +473,10 @@ class JobService:
             except Exception:
                 fault = "provider request failed"
 
-            if fault is None and call is not None and call.name in _INTERNAL_NAMES:
+            if fault is None and calls is not None and calls[0].name in _INTERNAL_NAMES:
+                # _calls guarantees an internal call is the only call in its reply.
                 try:
-                    outcome = self._internal(calling, call.name, call.arguments)
+                    outcome = self._internal(calling, calls[0].name, calls[0].arguments)
                 except _PlannerFault as exc:
                     fault = self._bounded(str(exc), _REASON_CHARS)
                 else:
@@ -429,8 +486,13 @@ class JobService:
                     planner_failures = 0
                     continue
 
-            if fault is None and call is not None and call.name not in _INTERNAL_NAMES:
-                fault = self._world_call_fault(calling, call)
+            if fault is None and calls is not None:
+                # Every element of an ordered world-action batch is validated
+                # fail-closed before the first one is persisted.
+                for call in calls:
+                    fault = self._world_call_fault(calling, call)
+                    if fault is not None:
+                        break
 
             if fault is not None:
                 planner_failures += 1
@@ -446,7 +508,7 @@ class JobService:
                     raise self._store_error(exc) from exc
                 continue
 
-            if call is None or call.name in _INTERNAL_NAMES:
+            if calls is None or calls[0].name in _INTERNAL_NAMES:
                 # Unreachable: internal calls return, continue, or fault above.
                 return self._pause_internal(
                     calling, "planner requested an unknown internal job tool"
@@ -455,21 +517,29 @@ class JobService:
                 # Re-asking cannot create more budget; stop deterministically.
                 return self._pause_internal(calling, "action budget exhausted")
 
-            action = {
-                "id": f"action_{uuid4().hex}",
-                "name": call.name,
-                "arguments": call.arguments,
-            }
-            response = self._action_flow(calling, action)
+            actions = [
+                {
+                    "id": f"action_{uuid4().hex}",
+                    "name": call.name,
+                    "arguments": call.arguments,
+                }
+                for call in calls
+            ]
+            queue = [
+                {**action, "read_only": action["name"] in READ_ONLY_WORLD_TOOLS}
+                for action in actions[1:]
+            ]
+            response = self._action_flow(calling, actions[0])
             try:
                 self.store.save_job_action(
                     job_id=calling.job_id,
-                    action=action,
-                    read_only=call.name in READ_ONLY_WORLD_TOOLS,
+                    action=actions[0],
+                    read_only=calls[0].name in READ_ONLY_WORLD_TOOLS,
                     response=response,
                     phase=calling.phase,
                     summary=calling.summary,
                     now=self._clock(),
+                    action_queue=queue,
                 )
             except StoreError as exc:
                 raise self._store_error(exc) from exc
@@ -620,17 +690,28 @@ class JobService:
             raise _PlannerFault(self._bounded(message, _REASON_CHARS)) from exc
         raise _PlannerFault("planner requested an unknown internal job tool")
 
-    def _one_call(self, reply: ProviderReply):
+    def _calls(self, reply: ProviderReply) -> list[ProviderToolCall]:
+        """Validate one planner reply as either a lone internal job tool or an
+        ordered batch of world actions. Anything else is a retryable planner fault."""
         if not isinstance(reply, ProviderReply):
             raise ProviderError("provider returned an invalid reply")
-        if len(reply.tool_calls) != 1:
-            raise ProviderError("job planner must return exactly one tool call")
-        call = reply.tool_calls[0]
-        if not isinstance(call.name, str) or not call.name:
-            raise ProviderError("job planner returned an invalid tool name")
-        if not isinstance(call.arguments, dict):
-            raise ProviderError("job planner tool arguments must be an object")
-        return call
+        if not reply.tool_calls:
+            raise ProviderError("job planner returned no tool call")
+        if len(reply.tool_calls) > _MAX_ACTION_BATCH:
+            raise ProviderError(
+                f"job planner returned more than {_MAX_ACTION_BATCH} tool calls in one reply"
+            )
+        calls = list(reply.tool_calls)
+        for call in calls:
+            if not isinstance(call.name, str) or not call.name:
+                raise ProviderError("job planner returned an invalid tool name")
+            if not isinstance(call.arguments, dict):
+                raise ProviderError("job planner tool arguments must be an object")
+        if len(calls) > 1 and any(call.name in _INTERNAL_NAMES for call in calls):
+            raise ProviderError(
+                "internal job tools must be sent alone; batch only world actions in one reply"
+            )
+        return calls
 
     def _budget_reason(self, job: JobRecord, *, before_model: bool) -> str | None:
         if before_model and job.model_calls >= job.budgets["max_model_calls"]:
@@ -677,11 +758,19 @@ class JobService:
         )
         system = (
             "You are the durable planner for one Minecraft citizen job. Minecraft is authoritative. "
-            "Return exactly one native tool call per response and never return parallel calls. "
-            "World tools are executed one at a time. Use job_define_plan before non-trivial work, "
+            "Each reply is either a single internal job tool call, or one ordered batch of 1-8 "
+            "world-tool calls; never mix internal job tools with world actions in one reply. "
+            "A world-action batch executes sequentially in exactly the given order, one persisted "
+            "action at a time, without re-asking you between steps, so batch only steps whose "
+            "later actions do not depend on earlier results. If any action in a batch fails, its "
+            "remaining actions are discarded and you are re-asked with the failure. "
+            "Use job_define_plan before non-trivial work, "
             "job_checkpoint after meaningful progress, and job_finish only when confirmed action "
             "IDs prove every completion criterion. "
             "A world-tool acceptance or old checkpoint is not proof of current world state. "
+            "When an actor answer or an inventory change suggests a needed item or condition is "
+            "now supplied, confirm it with one read-only observation such as get_self_status "
+            "before mutating the world or declaring the requirement unresolved again. "
             "Capability limits are absolute: the citizen moves and acts only on foot within its "
             "current dimension, and there is no portal, teleport, or dimension-crossing tool, so "
             "blocks, ores, structures, and biomes in other dimensions are unreachable. Never "

@@ -80,6 +80,7 @@ class JobRecord:
     active_seconds: int
     pending_action: dict[str, Any] | None
     pending_read_only: bool
+    action_queue: list[dict[str, Any]]
     recovery_required: bool
     last_response: dict[str, Any] | None
     pause_reason: str | None
@@ -188,6 +189,7 @@ class SQLiteStore:
                     active_seconds INTEGER NOT NULL DEFAULT 0,
                     pending_action_json TEXT,
                     pending_read_only INTEGER NOT NULL DEFAULT 0,
+                    action_queue_json TEXT NOT NULL DEFAULT '[]',
                     recovery_required INTEGER NOT NULL DEFAULT 0,
                     last_response_json TEXT,
                     pause_reason TEXT,
@@ -265,9 +267,20 @@ class SQLiteStore:
                     ON turns(citizen_id)
                     WHERE state IN ('calling', 'waiting_tool');
 
-                PRAGMA user_version = 4;
+                PRAGMA user_version = 5;
                 """
             )
+        with closing(self._connect()) as connection:
+            job_columns = {
+                row["name"]
+                for row in connection.execute("PRAGMA table_info(jobs)").fetchall()
+            }
+            if "action_queue_json" not in job_columns:
+                # Databases created before the ordered action batch existed gain the
+                # column in place; a NULL reads as an empty queue.
+                connection.execute(
+                    "ALTER TABLE jobs ADD COLUMN action_queue_json TEXT NOT NULL DEFAULT '[]'"
+                )
 
     @staticmethod
     def _dump(value: Any) -> str:
@@ -325,6 +338,11 @@ class SQLiteStore:
                 else None
             ),
             pending_read_only=bool(row["pending_read_only"]),
+            action_queue=(
+                json.loads(row["action_queue_json"])
+                if row["action_queue_json"]
+                else []
+            ),
             recovery_required=bool(row["recovery_required"]),
             last_response=(
                 json.loads(row["last_response_json"])
@@ -1131,6 +1149,7 @@ class SQLiteStore:
         phase: str,
         summary: str,
         now: float,
+        action_queue: list[dict[str, Any]] = (),
     ) -> JobRecord:
         connection = self._connect()
         try:
@@ -1148,7 +1167,8 @@ class SQLiteStore:
             connection.execute(
                 """
                 UPDATE jobs SET state = 'WAITING_ACTION', pending_action_json = ?,
-                                pending_read_only = ?, phase = ?, summary = ?,
+                                pending_read_only = ?, action_queue_json = ?,
+                                phase = ?, summary = ?,
                                 last_response_json = ?, pause_reason = NULL,
                                 revision = revision + 1, updated_at = ?
                  WHERE job_id = ?
@@ -1156,6 +1176,7 @@ class SQLiteStore:
                 (
                     self._dump(action),
                     int(read_only),
+                    self._dump(list(action_queue)),
                     phase,
                     summary,
                     self._dump(response),
@@ -1163,6 +1184,119 @@ class SQLiteStore:
                     job_id,
                 ),
             )
+            updated = self._job_row(connection, job_id)
+            connection.commit()
+            return self._job_record(updated)
+        except BaseException:
+            connection.rollback()
+            raise
+        finally:
+            connection.close()
+
+    def pop_job_action_queue(
+        self,
+        *,
+        job_id: str,
+        response: dict[str, Any],
+        now: float,
+    ) -> JobRecord:
+        """Dispatch the next queued planner action without a new model call.
+
+        Only legal while the job sits READY after a confirmed result; the queue head
+        becomes the persisted pending action and keeps its planner-assigned identity.
+        """
+        connection = self._connect()
+        try:
+            connection.execute("BEGIN IMMEDIATE")
+            row = self._job_row(connection, job_id)
+            if row["state"] != "READY":
+                raise StoreError(f"job_{row['state'].lower()}")
+            queue = (
+                json.loads(row["action_queue_json"])
+                if row["action_queue_json"]
+                else []
+            )
+            if not queue:
+                raise StoreError("job_queue_empty")
+            head = dict(queue[0])
+            read_only = bool(head.pop("read_only", False))
+            connection.execute(
+                """
+                INSERT INTO job_events(job_id, event_type, action_id, payload_json, created_at)
+                VALUES (?, 'action', ?, ?, ?)
+                """,
+                (job_id, head["id"], self._dump(head), now),
+            )
+            connection.execute(
+                """
+                UPDATE jobs SET state = 'WAITING_ACTION', pending_action_json = ?,
+                                pending_read_only = ?, action_queue_json = ?,
+                                last_response_json = ?, pause_reason = NULL,
+                                revision = revision + 1, updated_at = ?
+                 WHERE job_id = ?
+                """,
+                (
+                    self._dump(head),
+                    int(read_only),
+                    self._dump(queue[1:]),
+                    self._dump(response),
+                    now,
+                    job_id,
+                ),
+            )
+            updated = self._job_row(connection, job_id)
+            connection.commit()
+            return self._job_record(updated)
+        except BaseException:
+            connection.rollback()
+            raise
+        finally:
+            connection.close()
+
+    def clear_job_action_queue(
+        self,
+        *,
+        job_id: str,
+        reason: str,
+        now: float,
+    ) -> JobRecord:
+        """Discard queued planner actions and journal why, so the planner re-plans them."""
+        connection = self._connect()
+        try:
+            connection.execute("BEGIN IMMEDIATE")
+            row = self._job_row(connection, job_id)
+            queue = (
+                json.loads(row["action_queue_json"])
+                if row["action_queue_json"]
+                else []
+            )
+            if queue:
+                connection.execute(
+                    """
+                    INSERT INTO job_events(job_id, event_type, payload_json, created_at)
+                    VALUES (?, 'queue_discarded', ?, ?)
+                    """,
+                    (
+                        job_id,
+                        self._dump(
+                            {
+                                "reason": reason,
+                                "discarded_action_ids": [
+                                    item.get("id") for item in queue
+                                ],
+                            }
+                        ),
+                        now,
+                    ),
+                )
+                connection.execute(
+                    """
+                    UPDATE jobs SET action_queue_json = '[]',
+                                    revision = revision + 1, updated_at = ?
+                     WHERE job_id = ?
+                    """,
+                    (now, job_id),
+                )
             updated = self._job_row(connection, job_id)
             connection.commit()
             return self._job_record(updated)
@@ -1200,7 +1334,8 @@ class SQLiteStore:
             )
             connection.execute(
                 """
-                UPDATE jobs SET state = 'READY', revision = revision + 1,
+                UPDATE jobs SET state = 'READY', action_queue_json = '[]',
+                                revision = revision + 1,
                                 updated_at = ?
                  WHERE job_id = ?
                 """,
@@ -1308,6 +1443,7 @@ class SQLiteStore:
             connection.execute(
                 """
                 UPDATE jobs SET state = 'NEEDS_INPUT', phase = ?, summary = ?,
+                                action_queue_json = '[]',
                                 last_response_json = ?, pause_reason = NULL,
                                 revision = revision + 1, updated_at = ?
                  WHERE job_id = ?
@@ -1363,6 +1499,7 @@ class SQLiteStore:
                 """
                 UPDATE jobs SET state = 'COMPLETED', phase = ?, summary = ?,
                                 pending_action_json = NULL, pending_read_only = 0,
+                                action_queue_json = '[]',
                                 recovery_required = 0, last_response_json = ?,
                                 pause_reason = NULL, revision = revision + 1,
                                 updated_at = ?
@@ -1661,6 +1798,7 @@ class SQLiteStore:
                                 active_seconds = MAX(active_seconds, ?),
                                 pending_action_json = CASE WHEN ? THEN NULL ELSE pending_action_json END,
                                 pending_read_only = CASE WHEN ? THEN 0 ELSE pending_read_only END,
+                                action_queue_json = CASE WHEN ? THEN action_queue_json ELSE '[]' END,
                                 recovery_required = ?,
                                 last_response_json = CASE WHEN ? THEN last_response_json ELSE NULL END,
                                 pause_reason = CASE WHEN ? THEN pause_reason ELSE NULL END,
@@ -1674,6 +1812,7 @@ class SQLiteStore:
                     supplied_seconds,
                     int(clear_pending),
                     int(clear_pending),
+                    int(reemit),
                     int(recovery_required),
                     int(reemit),
                     int(reemit),
@@ -1863,6 +2002,7 @@ class SQLiteStore:
                 UPDATE jobs SET state = ?, pause_reason = ?, last_response_json = ?,
                                 pending_action_json = CASE WHEN ? THEN NULL ELSE pending_action_json END,
                                 pending_read_only = CASE WHEN ? THEN 0 ELSE pending_read_only END,
+                                action_queue_json = CASE WHEN ? THEN '[]' ELSE action_queue_json END,
                                 recovery_required = CASE WHEN ? THEN 0 ELSE recovery_required END,
                                 revision = revision + 1, updated_at = ?
                  WHERE job_id = ?
@@ -1871,6 +2011,7 @@ class SQLiteStore:
                     target_state,
                     reason,
                     self._dump(stored_response),
+                    int(effective_clear_pending),
                     int(effective_clear_pending),
                     int(effective_clear_pending),
                     int(effective_clear_pending),
@@ -1914,6 +2055,7 @@ class SQLiteStore:
             connection.execute(
                 """
                 UPDATE jobs SET state = 'PAUSED', pause_reason = ?,
+                                action_queue_json = '[]',
                                 last_response_json = ?, revision = revision + 1,
                                 updated_at = ? WHERE job_id = ?
                 """,

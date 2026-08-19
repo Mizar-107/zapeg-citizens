@@ -252,6 +252,53 @@ class DurableJobTest(TempDatabaseTest, unittest.TestCase):
         context = json.dumps(provider.calls[-1][0], ensure_ascii=False)
         self.assertIn("Use spruce with a stone foundation.", context)
 
+    def test_resume_after_needs_input_dispatches_an_ordered_batch(self) -> None:
+        # The wood-chopping regression: a requirement pause must resume into real
+        # work, and the planner may verify and act in one ordered batch.
+        provider = FakeProvider(
+            reply(
+                "job_needs_input",
+                {
+                    "phase": "tools",
+                    "summary": "An axe is required.",
+                    "question": "I need an axe in my inventory before I can chop wood.",
+                },
+            ),
+            ProviderReply(
+                content="",
+                assistant_message={"role": "assistant", "content": ""},
+                tool_calls=(
+                    ProviderToolCall("look_around", {}),
+                    ProviderToolCall("mine", {"block_ids": ["minecraft:oak_log"], "count": 4}),
+                ),
+            ),
+            reply("look_around", {}),
+        )
+        service = self.service(provider)
+        blocked = service.start(job_payload(goal="Go chop some wood."))
+        self.assertEqual("NEEDS_INPUT", blocked["kind"])
+
+        resumed = service.resume(
+            resume_payload(
+                "resume-with-axe",
+                "job-1",
+                answer="The citizen's inventory changed while paused: +1x minecraft:iron_axe.",
+            )
+        )
+        self.assertEqual("ACTION", resumed["kind"])
+        self.assertEqual("look_around", resumed["action"]["name"])
+        context = json.dumps(provider.calls[-1][0], ensure_ascii=False)
+        self.assertIn("inventory changed", context)
+
+        # The queued chop dispatches right after the verification succeeds.
+        chopping = service.result(
+            result_payload(
+                "verify-axe", "job-1", resumed["action"]["id"], {"success": True}
+            )
+        )
+        self.assertEqual("mine", chopping["action"]["name"])
+        self.assertEqual(2, len(provider.calls))
+
     def test_planner_is_told_dimension_travel_is_unavailable(self) -> None:
         provider = FakeProvider(reply("look_around", {}))
         service = self.service(provider)
@@ -469,7 +516,7 @@ class DurableJobTest(TempDatabaseTest, unittest.TestCase):
         self.assertEqual(2, len(provider.calls))
         feedback = json.dumps(provider.calls[-1][0], ensure_ascii=False)
         self.assertIn("planner_error", feedback)
-        self.assertIn("exactly one", feedback)
+        self.assertIn("no tool call", feedback)
         stored = service.store.get_job("job-1")
         assert stored is not None
         self.assertEqual("WAITING_ACTION", stored.state)
@@ -524,7 +571,7 @@ class DurableJobTest(TempDatabaseTest, unittest.TestCase):
         service = self.service(provider, CITIZENS_MAX_JOB_PLANNER_RETRIES="0")
         paused = service.start(job_payload())
         self.assertEqual("PAUSED", paused["kind"])
-        self.assertIn("exactly one", paused["reason"])
+        self.assertIn("no tool call", paused["reason"])
         self.assertEqual(1, len(provider.calls))
 
     def test_unavailable_world_tool_is_retried_with_feedback(self) -> None:
@@ -539,7 +586,7 @@ class DurableJobTest(TempDatabaseTest, unittest.TestCase):
         feedback = json.dumps(provider.calls[-1][0], ensure_ascii=False)
         self.assertIn("unavailable world tool", feedback)
 
-    def test_tool_free_and_parallel_provider_replies_pause_safely(self) -> None:
+    def test_tool_free_provider_replies_pause_safely(self) -> None:
         no_call = ProviderReply(
             content="done",
             assistant_message={"role": "assistant", "content": "done"},
@@ -548,11 +595,155 @@ class DurableJobTest(TempDatabaseTest, unittest.TestCase):
         service = self.service(FakeProvider(no_call, no_call, no_call))
         paused = service.start(job_payload())
         self.assertEqual("PAUSED", paused["kind"])
-        self.assertIn("exactly one", paused["reason"])
+        self.assertIn("no tool call", paused["reason"])
 
-        second_path = self.db_path + ".parallel"
-        configured = settings(second_path)
-        parallel_call = ProviderReply(
+    def test_ordered_action_batch_runs_sequentially_without_extra_model_calls(self) -> None:
+        batch = ProviderReply(
+            content="",
+            assistant_message={"role": "assistant", "content": ""},
+            tool_calls=(
+                ProviderToolCall("look_around", {}),
+                ProviderToolCall("mine", {"count": 1}),
+                ProviderToolCall("mine", {"count": 2}),
+            ),
+        )
+        provider = FakeProvider(batch, reply("look_around", {}))
+        service = self.service(provider)
+        started = service.start(job_payload())
+        self.assertEqual("ACTION", started["kind"])
+        self.assertEqual("look_around", started["action"]["name"])
+        self.assertEqual(1, len(provider.calls))
+        first_id = started["action"]["id"]
+
+        second = service.result(
+            result_payload("batch-result-1", "job-1", first_id, {"success": True})
+        )
+        self.assertEqual("ACTION", second["kind"])
+        self.assertEqual("mine", second["action"]["name"])
+        self.assertEqual({"count": 1}, second["action"]["arguments"])
+        # The queued step dispatches without asking the model again.
+        self.assertEqual(1, len(provider.calls))
+
+        third = service.result(
+            result_payload(
+                "batch-result-2", "job-1", second["action"]["id"], {"success": True}
+            )
+        )
+        self.assertEqual("mine", third["action"]["name"])
+        self.assertEqual({"count": 2}, third["action"]["arguments"])
+        self.assertEqual(1, len(provider.calls))
+
+        # The drained queue hands control back to the planner.
+        followup = service.result(
+            result_payload(
+                "batch-result-3", "job-1", third["action"]["id"], {"success": True}
+            )
+        )
+        self.assertEqual("look_around", followup["action"]["name"])
+        self.assertEqual(2, len(provider.calls))
+        stored = service.store.get_job("job-1")
+        assert stored is not None
+        self.assertEqual(3, stored.actions_completed)
+        self.assertEqual(2, stored.model_calls)
+
+    def test_failed_action_discards_the_remaining_queue_and_replans(self) -> None:
+        batch = ProviderReply(
+            content="",
+            assistant_message={"role": "assistant", "content": ""},
+            tool_calls=(
+                ProviderToolCall("mine", {"count": 1}),
+                ProviderToolCall("mine", {"count": 2}),
+            ),
+        )
+        provider = FakeProvider(batch, reply("look_around", {}))
+        service = self.service(provider)
+        started = service.start(job_payload())
+        self.assertEqual("mine", started["action"]["name"])
+
+        replanned = service.result(
+            result_payload(
+                "batch-failure",
+                "job-1",
+                started["action"]["id"],
+                {"success": False, "message": "no reachable block"},
+            )
+        )
+        # The failed head discards the queued second mine and re-asks the planner.
+        self.assertEqual("look_around", replanned["action"]["name"])
+        self.assertEqual(2, len(provider.calls))
+        events = service.store.recent_job_events("job-1", 16)
+        discarded = [event for event in events if event["type"] == "queue_discarded"]
+        self.assertEqual(1, len(discarded))
+        self.assertIn("failed", discarded[0]["payload"]["reason"])
+        feedback = json.dumps(provider.calls[-1][0], ensure_ascii=False)
+        self.assertIn("queue_discarded", feedback)
+        stored = service.store.get_job("job-1")
+        assert stored is not None
+        self.assertEqual([], stored.action_queue)
+
+    def test_batch_mixing_internal_tools_is_rejected_with_feedback(self) -> None:
+        mixed = ProviderReply(
+            content="",
+            assistant_message={"role": "assistant", "content": ""},
+            tool_calls=(
+                ProviderToolCall(
+                    "job_define_plan",
+                    {"phase": "p", "summary": "s", "steps": ["one"]},
+                ),
+                ProviderToolCall("mine", {"count": 1}),
+            ),
+        )
+        provider = FakeProvider(mixed, reply("mine", {"count": 1}))
+        service = self.service(provider)
+        started = service.start(job_payload())
+        self.assertEqual("ACTION", started["kind"])
+        self.assertEqual("mine", started["action"]["name"])
+        self.assertEqual(2, len(provider.calls))
+        feedback = json.dumps(provider.calls[-1][0], ensure_ascii=False)
+        self.assertIn("internal job tools must be sent alone", feedback)
+
+    def test_oversized_batch_is_rejected_with_feedback(self) -> None:
+        oversized = ProviderReply(
+            content="",
+            assistant_message={"role": "assistant", "content": ""},
+            tool_calls=tuple(
+                ProviderToolCall("look_around", {}) for _ in range(9)
+            ),
+        )
+        provider = FakeProvider(oversized, reply("look_around", {}))
+        service = self.service(provider)
+        started = service.start(job_payload())
+        self.assertEqual("ACTION", started["kind"])
+        self.assertEqual(2, len(provider.calls))
+        feedback = json.dumps(provider.calls[-1][0], ensure_ascii=False)
+        self.assertIn("more than 8", feedback)
+
+    def test_action_budget_pauses_mid_queue(self) -> None:
+        batch = ProviderReply(
+            content="",
+            assistant_message={"role": "assistant", "content": ""},
+            tool_calls=(
+                ProviderToolCall("mine", {"count": 1}),
+                ProviderToolCall("mine", {"count": 2}),
+            ),
+        )
+        provider = FakeProvider(batch)
+        service = self.service(provider)
+        started = service.start(job_payload(max_actions=1))
+        paused = service.result(
+            result_payload(
+                "budget-mid-queue", "job-1", started["action"]["id"], {"success": True}
+            )
+        )
+        self.assertEqual("PAUSED", paused["kind"])
+        self.assertIn("action budget", paused["reason"])
+        self.assertEqual(1, len(provider.calls))
+        stored = service.store.get_job("job-1")
+        assert stored is not None
+        self.assertEqual([], stored.action_queue)
+
+    def test_queued_batch_survives_a_brain_restart(self) -> None:
+        batch = ProviderReply(
             content="",
             assistant_message={"role": "assistant", "content": ""},
             tool_calls=(
@@ -560,15 +751,55 @@ class DurableJobTest(TempDatabaseTest, unittest.TestCase):
                 ProviderToolCall("mine", {"count": 1}),
             ),
         )
-        parallel = FakeProvider(parallel_call, parallel_call, parallel_call)
-        parallel_service = JobService(
-            settings=configured,
-            store=SQLiteStore(configured.db_path),
-            provider=parallel,
+        service = self.service(FakeProvider(batch))
+        started = service.start(job_payload())
+
+        reloaded = self.service(FakeProvider())
+        resumed = reloaded.result(
+            result_payload(
+                "restart-queue-result", "job-1", started["action"]["id"], {"success": True}
+            )
         )
-        paused_parallel = parallel_service.start(job_payload(job_id="job-2"))
-        self.assertEqual("PAUSED", paused_parallel["kind"])
-        self.assertIn("exactly one", paused_parallel["reason"])
+        self.assertEqual("mine", resumed["action"]["name"])
+
+    def test_pause_and_recovery_drop_the_stale_queue(self) -> None:
+        batch = ProviderReply(
+            content="",
+            assistant_message={"role": "assistant", "content": ""},
+            tool_calls=(
+                ProviderToolCall("mine", {"count": 1}),
+                ProviderToolCall("mine", {"count": 2}),
+            ),
+        )
+        provider = FakeProvider(batch)
+        service = self.service(provider)
+        started = service.start(job_payload())
+        service.pause(
+            {
+                "protocol": 3,
+                "request_id": "pause-mid-batch",
+                "job_id": "job-1",
+                "reason": "server stopping",
+            }
+        )
+
+        recovering_provider = FakeProvider(reply("look_around", {}))
+        recovering = self.service(recovering_provider)
+        observation = recovering.resume(
+            resume_payload(
+                "resume-mid-batch",
+                "job-1",
+                pending_action_id=started["action"]["id"],
+                uncertain=True,
+            )
+        )
+        # The interrupted head forces re-observation; the stale queue is gone.
+        self.assertEqual("look_around", observation["action"]["name"])
+        stored = recovering.store.get_job("job-1")
+        assert stored is not None
+        self.assertEqual([], stored.action_queue)
+        offered = {tool["function"]["name"] for tool in recovering_provider.calls[0][1]}
+        self.assertNotIn("mine", offered)
 
     def test_pause_cancel_status_and_list_use_bounded_flow_projection(self) -> None:
         secret_goal = "sort chests SECRET-GOAL-CONTENT"
