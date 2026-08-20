@@ -14,6 +14,15 @@ class ProviderError(RuntimeError):
     """A safe-to-report provider failure without request or secret contents."""
 
 
+class ProviderUnavailable(ProviderError):
+    """A transient transport/capacity failure the model cannot fix.
+
+    Raised for queue-slot timeouts, HTTP/socket errors, oversized or undecodable
+    provider bodies. Job planning maps this to a retryable pause instead of
+    burning bounded planner-fault retries on an outage.
+    """
+
+
 @dataclass(frozen=True, slots=True)
 class ProviderToolCall:
     name: str
@@ -97,24 +106,24 @@ class OllamaChatProvider:
 
         acquired = self._slots.acquire(timeout=self._queue_timeout_seconds)
         if not acquired:
-            raise ProviderError("provider is busy")
+            raise ProviderUnavailable("provider is busy")
         try:
             try:
                 with self._opener.open(request, timeout=self._timeout_seconds) as response:
                     raw = response.read(self._max_response_bytes + 1)
             except HTTPError as exc:
-                raise ProviderError(f"provider returned HTTP {exc.code}") from exc
+                raise ProviderUnavailable(f"provider returned HTTP {exc.code}") from exc
             except (URLError, TimeoutError, OSError) as exc:
-                raise ProviderError("provider request failed") from exc
+                raise ProviderUnavailable("provider request failed") from exc
         finally:
             self._slots.release()
 
         if len(raw) > self._max_response_bytes:
-            raise ProviderError("provider response exceeded the configured limit")
+            raise ProviderUnavailable("provider response exceeded the configured limit")
         try:
             document = json.loads(raw.decode("utf-8"))
         except (UnicodeDecodeError, json.JSONDecodeError) as exc:
-            raise ProviderError("provider returned invalid JSON") from exc
+            raise ProviderUnavailable("provider returned invalid JSON") from exc
         return self._parse(document)
 
     @staticmethod

@@ -23,6 +23,7 @@ Use this workflow before designing or constructing a non-trivial structure.
    every requested cell inside the authorized region.
 7. Verify after construction: planned block states match, exterior doors and stairs are passable,
    rooms are reachable and furnished, the roof is closed, unsupported detail items did not drop, and
-   interior floors are sufficiently lit. Patch only observed discrepancies.
+   interior floors are sufficiently lit. Patch only observed discrepancies. Survey, build, and verify
+   are one job; do not stop after the first `build` call if the original instruction is unfinished.
 
 There is no `place_block` tool. Place an exact block with `build` and a one-cell `set` op.

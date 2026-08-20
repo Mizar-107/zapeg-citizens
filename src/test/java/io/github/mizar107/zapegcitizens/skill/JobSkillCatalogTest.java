@@ -23,6 +23,7 @@ final class JobSkillCatalogTest {
         assertTrue(JobSkillCatalog.require("mining").contains("diamond_ore"));
         assertTrue(JobSkillCatalog.require("mining").contains("punching with empty hands"));
         assertTrue(JobSkillCatalog.require("mining").contains("never pause"));
+        assertTrue(JobSkillCatalog.require("mining").contains("only then is a missing tool a real blocker"));
         assertTrue(JobSkillCatalog.require("combat").contains("confirmed target deaths"));
     }
 

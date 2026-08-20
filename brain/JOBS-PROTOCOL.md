@@ -230,9 +230,25 @@ Paused, canceled, failed, budget-exhausted, or safely halted work:
 
 `progress` is always present. The kind-specific field is `action`, `question`, `speech`, or `reason`. `phase`, `summary`, speech, questions, reasons, identifiers, and nested structures are bounded before persistence or return.
 
-A provider pass produces either exactly one private planner call or an ordered batch of one to eight world-tool calls. `job_define_plan`, `job_checkpoint`, `job_needs_input`, and `job_finish` are private planner tools and are never sent to Minecraft as actions; a pass mixing planner and world tools, or a batch larger than eight, is rejected with feedback. Several bounded internal planner passes may occur within one HTTP request, but the response contains no more than one world action: the first batch element is returned and the validated remainder is persisted as the job's action queue. Each confirmed successful result releases the next queued action without another model call; a failed result discards the queue and the planner re-plans. Pausing, cancellation, completion, and planner faults also discard any queued remainder, so a stale batch never survives a state change. `job_finish` is rejected unless it cites successful, meaningful confirmed evidence; workflow loading alone is insufficient, and every mutating result must be followed by a cited successful read-only verification.
+A provider pass produces either exactly one private planner call or an ordered batch of one to eight world-tool calls. `job_define_plan`, `job_checkpoint`, `job_needs_input`, and `job_finish` are private planner tools and are never sent to Minecraft as actions; a pass mixing planner and world tools, or a batch larger than eight, is rejected with feedback. Several bounded internal planner passes may occur within one HTTP request, but the response contains no more than one world action: the first batch element is returned and the validated remainder is persisted as the job's action queue. Each confirmed successful result releases the next queued action without another model call; a failed result discards the queue and the planner re-plans. Pausing, cancellation, completion, and planner faults also discard any queued remainder, so a stale batch never survives a state change. The original player instruction is persisted for the whole job lifetime and remains the completion bar. After a successful world action the planner is asked for the next remaining step toward that instruction. `job_finish` is rejected unless it cites successful, meaningful confirmed evidence and any implied later steps (deposit, craft, and similar) are proven by matching world actions; workflow loading alone is insufficient, one mine is not completion unless that was the whole instruction, and every mutating result must be followed by a cited successful read-only verification.
 
 `job_needs_input` is the explicit blocker/requirement channel, not only a literal question. The planner is told its hard capability limits (on-foot movement within the current dimension only; no portal, teleport, or dimension-crossing tool) and is instructed to call `job_needs_input` immediately when a goal needs an unavailable capability, an unreachable place, or owner-supplied materials/tools, stating exactly what is needed or what cannot be done and why. The `question` field carries that requirement/blocker text; Forge delivers it to the owner as the citizen's own speech and the job waits for an answer or cancellation.
+
+A world action whose exact `(name, arguments)` signature already failed twice consecutively (with no later identical success) is rejected as a planner fault telling the model to change the target, arguments, or approach, or to state the real blocker; bounded retries then pause the job with that reason instead of burning the action budget on a doomed loop.
+
+## Retryable pause reasons
+
+Three machine-readable `reason` prefixes carry contract semantics for Forge:
+
+- `provider_unavailable: ...` — a transport/capacity outage (busy queue slot, HTTP error, undecodable body). It consumes no planner-fault retry; Forge maps it to its bounded `PAUSED_BRAIN` backoff and resumes automatically.
+- `planning_in_progress: ...` — the internal planning loop hit the `CITIZENS_MAX_JOB_REQUEST_SECONDS` wall clock and yielded so the HTTP request stays inside the mod's request timeout. Forge resumes automatically; planning continues from the durable checkpoint. Not announced to players.
+- `stage_budget_exhausted: ...` — a deterministic staged-template stall (see below). Forge announces it with resume advice; an explicit `/resume` re-arms the stage's action window.
+
+## Staged job templates
+
+`detect_template` deterministically matches a small set of goals at `/v1/job/start` — explicit `template:<name> key=value` syntax always wins, plus conservative English/Turkish phrasings for `gather_wood(count)`, `mine_ore(type, count)`, and `simple_build(blueprint)` with the predefined blueprints `shelter_hut`, `storage_hut`, and `watchtower`. Anything else stays a freeform job with unchanged behavior.
+
+A matched template persists with the job (`jobs.template_json`, schema `user_version` 6, migrates in place) as an ordered list of checkpointed stages, each carrying its own goal text, action budget, and exit condition. Stage transitions are server code, never the model: a stage advances only when its exit condition is met by confirmed successful action evidence recorded at or after the previous stage's satisfaction point, so a legitimate jump-ahead (one successful `mine` proving survey and chop at once) is honored while stale earlier evidence never is. Advancing journals a model-visible `stage_advanced` event and discards any queued action batch planned for the previous stage. The model sees the current stage in a `template_stage` block and is told to pursue only that stage's goal; `job_finish` stays rejected until the final stage's evidence exists. Stage state survives restarts with the job row and resumes mid-stage.
 
 ## Persistence and limits
 
@@ -249,5 +265,6 @@ Relevant service caps and defaults:
 - `CITIZENS_MAX_JOB_CHECKPOINT_CHARS=16384`
 - `CITIZENS_MAX_JOB_RECENT_EVENTS=8`
 - `CITIZENS_MAX_JOB_INTERNAL_STEPS=8`
+- `CITIZENS_MAX_JOB_REQUEST_SECONDS=100`
 
 The per-job `max_actions`, `max_model_calls`, and `max_active_seconds` budgets are supplied by Forge and persisted with the job. Exhausting a budget yields `PAUSED`; it does not silently forget the job.

@@ -43,6 +43,28 @@ class SettingsTest(unittest.TestCase):
         self.assertEqual(8, configured.max_job_recent_events)
         self.assertEqual(8, configured.max_job_internal_steps)
         self.assertEqual(2, configured.max_job_planner_retries)
+        # Stays below the mod's default 150s request timeout so multi-pass
+        # planning yields a retryable planning_in_progress pause instead of a
+        # mod-side timeout.
+        self.assertEqual(100, configured.max_job_request_seconds)
+
+    def test_job_request_seconds_is_bounded_below_the_mod_timeout_cap(self) -> None:
+        configured = Settings.from_env(
+            {
+                "CITIZENS_LLM_MODEL": "model",
+                "CITIZENS_BRAIN_TOKEN": "token",
+                "CITIZENS_MAX_JOB_REQUEST_SECONDS": "570",
+            }
+        )
+        self.assertEqual(570, configured.max_job_request_seconds)
+        with self.assertRaisesRegex(ValueError, "between 10 and 570"):
+            Settings.from_env(
+                {
+                    "CITIZENS_LLM_MODEL": "model",
+                    "CITIZENS_BRAIN_TOKEN": "token",
+                    "CITIZENS_MAX_JOB_REQUEST_SECONDS": "571",
+                }
+            )
 
     def test_direct_and_file_secret_cannot_both_be_set(self) -> None:
         with self.assertRaisesRegex(ValueError, "set only one"):

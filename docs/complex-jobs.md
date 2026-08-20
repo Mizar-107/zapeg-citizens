@@ -82,6 +82,30 @@ including a failed action that may have changed part of the world, the evidence 
 successful read-only verification. Older action detail is compacted into the structured checkpoint
 while the most recent events remain verbatim, keeping a long job inside a bounded model context.
 
+## Staged templates, queueing, and the action watchdog
+
+A small set of common requests deterministically becomes a staged template at submission:
+`gather_wood(count)`, `mine_ore(type, count)`, and `simple_build(blueprint)` with predefined
+`shelter_hut`, `storage_hut`, and `watchtower` blueprints. Explicit `template:<name> key=value`
+syntax always works; conservative English/Turkish phrasings ("gather 16 wood", "32 odun topla",
+"mine 5 diamond ore", "build a shelter hut") are also recognized, and everything else remains a
+freeform job. A template runs as ordered, checkpointed stages (survey → act → verify/deliver;
+builds add a bill-of-materials stage that names every missing item out loud and waits — the
+inventory auto-resume then continues the job when the owner tosses supplies over). Stage
+transitions are deterministic server code driven by confirmed successful results, each stage has
+its own bounded action budget, the model plans only within the current stage, completion stays
+gated on the final stage, and stage state persists with the job so restarts resume mid-stage.
+
+Each citizen runs exactly one job; new requests while busy are queued (up to two waiting, with a
+queue-position announcement) and start automatically when the current job ends. A per-action
+watchdog bounds every physical step (4 minutes; 12 for mine/build/fish): a Numen task whose
+completion never arrives is canceled and reported to the planner as a machine-readable
+`action_timeout` failure instead of freezing the job until its multi-hour budget dies. Every
+failed step also produces one throttled chat line from the citizen itself, so replanning is
+visible instead of silent. The deterministic `equip_best_tool` primitive equips the best carried
+tool for a named block (or reports `missing_tool` for tool-gated blocks, or that punching works),
+so the planner no longer micro-manages `equip_item` guesses.
+
 ## Trusted workflows
 
 The dedicated server exposes a closed `load_skill` helper for four packaged workflows. This is a

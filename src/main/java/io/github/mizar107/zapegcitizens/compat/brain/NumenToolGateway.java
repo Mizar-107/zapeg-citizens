@@ -80,6 +80,7 @@ public final class NumenToolGateway {
             definitions.add(definition);
         }
         definitions.add(NumenSkillGateway.toolDefinition());
+        definitions.add(ZapegWorkerToolGateway.toolDefinition());
         return definitions;
     }
 
@@ -107,7 +108,9 @@ public final class NumenToolGateway {
                     "tool call id must start with " + TOOL_CALL_PREFIX + " and fit within 128 characters"));
             return;
         }
-        if (!WorkerToolPolicy.isAllowed(toolName) && !NumenSkillGateway.handles(toolName)) {
+        if (!WorkerToolPolicy.isAllowed(toolName)
+                && !NumenSkillGateway.handles(toolName)
+                && !ZapegWorkerToolGateway.handles(toolName)) {
             result.accept(failure("tool is not allowed for worker citizens: " + toolName));
             return;
         }
@@ -176,6 +179,20 @@ public final class NumenToolGateway {
         if (NumenSkillGateway.handles(toolName)) {
             try {
                 RESULTS.acceptImmediate(toolCallId, NumenSkillGateway.execute(args));
+            } catch (RuntimeException exception) {
+                String message = exception.getMessage();
+                RESULTS.acceptTerminal(toolCallId, failure(
+                        "invalid tool call: "
+                                + (message == null
+                                        ? exception.getClass().getSimpleName()
+                                        : message)));
+            }
+            return;
+        }
+        if (ZapegWorkerToolGateway.handles(toolName)) {
+            try {
+                RESULTS.acceptImmediate(
+                        toolCallId, ZapegWorkerToolGateway.execute(citizen, args));
             } catch (RuntimeException exception) {
                 String message = exception.getMessage();
                 RESULTS.acceptTerminal(toolCallId, failure(

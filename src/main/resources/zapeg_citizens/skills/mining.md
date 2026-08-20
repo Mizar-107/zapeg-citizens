@@ -20,8 +20,10 @@ Use this workflow for gathering ores, stone, logs, or other mineable blocks.
    and stop at its configured search budget.
 5. On wrong-tool, full-inventory, timeout or restart, observe inventory and nearby target blocks again
    before retrying. Count actual item delta so already-carried resources are never reported as new.
-6. If delivery or return was requested, open the exact destination container and use `transfer`, then
-   verify its inventory delta and return to the recorded home/actor position.
+6. If delivery, crafting, or return was requested in the original instruction, that is the same
+   job. After `mine` succeeds, continue to the next remaining step without waiting for another
+   player command. Open the exact destination container and use `transfer`, then verify its
+   inventory delta and return to the recorded home/actor position.
 
 There is no `break_block` tool. For one intentional exact break, move within reach and use
 `interact_at` with button=`left` and hold_ticks=`-1`.

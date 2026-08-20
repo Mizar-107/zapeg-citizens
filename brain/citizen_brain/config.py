@@ -85,6 +85,7 @@ class Settings:
     max_job_recent_events: int
     max_job_internal_steps: int
     max_job_planner_retries: int
+    max_job_request_seconds: int
 
     @classmethod
     def from_env(cls, env: Mapping[str, str] | None = None) -> "Settings":
@@ -168,5 +169,13 @@ class Settings:
             ),
             max_job_planner_retries=_integer(
                 values, "CITIZENS_MAX_JOB_PLANNER_RETRIES", 2, 0, 8
+            ),
+            # Wall-clock bound for one /v1/job HTTP request's internal planning
+            # loop. Keep it comfortably below the mod's
+            # CITIZENS_BRAIN_REQUEST_TIMEOUT_MS so multi-step planning yields a
+            # retryable "planning_in_progress" pause instead of a mod-side
+            # timeout that strands the job in PAUSED_BRAIN.
+            max_job_request_seconds=_integer(
+                values, "CITIZENS_MAX_JOB_REQUEST_SECONDS", 100, 10, 570
             ),
         )

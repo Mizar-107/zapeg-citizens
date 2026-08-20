@@ -73,6 +73,10 @@ configurations {
     }
 }
 
+tasks.withType(JavaCompile).configureEach {
+    options.encoding = 'UTF-8'
+}
+
 dependencies {
     minecraft "net.minecraftforge:forge:${minecraft_version}-${forge_version}"
 
@@ -86,6 +90,13 @@ dependencies {
     }
     pinnedNumen "com.dwinovo.numen:numen-api-forge-1.20.1:${numen_api_version}"
     pinnedNumen "curse.maven:numen-ai-1581109:${numen_curseforge_file_id}"
+
+    testCompileOnly fg.deobf("com.dwinovo.numen:numen-api-forge-1.20.1:${numen_api_version}") {
+        transitive = false
+    }
+    testRuntimeOnly fg.deobf("com.dwinovo.numen:numen-api-forge-1.20.1:${numen_api_version}") {
+        transitive = false
+    }
 
     testImplementation platform('org.junit:junit-bom:5.10.2')
     testImplementation 'org.junit.jupiter:junit-jupiter'

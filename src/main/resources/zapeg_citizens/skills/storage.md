@@ -15,7 +15,9 @@ Use this workflow for sorting, consolidating, or moving items among containers.
 4. With Numen primitives, visit one exact container at a time: move beside it, right-click it with
    `interact_at`, call `inspect_gui`, perform all safe slot moves for that GUI in one `transfer` call,
    then `close_gui`. `transfer` cannot move directly from one closed container to another; use the
-   citizen inventory as bounded transit space.
+   citizen inventory as bounded transit space. If gathering, crafting, or another earlier step was
+   part of the same original instruction, continue into this storage work without waiting for a new
+   player command.
 5. Checkpoint after each closed container. On retry or restart, inspect again and reconcile actual
    contents instead of replaying old slot indices. Slot numbers and stack sizes may have changed.
 6. Completion requires conservation evidence: every original stack is present exactly once, all

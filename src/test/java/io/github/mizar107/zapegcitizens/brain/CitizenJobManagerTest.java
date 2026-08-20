@@ -1,5 +1,7 @@
 package io.github.mizar107.zapegcitizens.brain;
 
+import com.google.gson.JsonObject;
+import com.google.gson.JsonParser;
 import io.github.mizar107.zapegcitizens.data.CitizenJobData.ActorContext;
 import io.github.mizar107.zapegcitizens.data.CitizenJobData.JobBudget;
 import io.github.mizar107.zapegcitizens.data.CitizenJobData.JobProgress;
@@ -14,6 +16,7 @@ import java.util.UUID;
 
 import static org.junit.jupiter.api.Assertions.assertEquals;
 import static org.junit.jupiter.api.Assertions.assertFalse;
+import static org.junit.jupiter.api.Assertions.assertNull;
 import static org.junit.jupiter.api.Assertions.assertTrue;
 
 class CitizenJobManagerTest {
@@ -214,6 +217,85 @@ class CitizenJobManagerTest {
         assertTrue(HarvestPolicy.describesAxeSupply("+1x minecraft:iron_axe"));
         assertTrue(HarvestPolicy.describesAxeSupply("+1x mekanismtools:steel_axe"));
         assertFalse(HarvestPolicy.describesAxeSupply("+1x minecraft:stick"));
+        assertTrue(InstructionPolicy.isSequenceReissueRequest(
+                "Gather 8 wood then put it in the chest.",
+                "Say continue and I will put the logs in the chest."));
+        assertFalse(InstructionPolicy.isSequenceReissueRequest(
+                "Build a villa here.",
+                "Should the villa use spruce or oak?"));
+        assertTrue(InstructionPolicy.continueOriginalInstructionAnswer()
+                .contains("original instruction"));
+    }
+
+    @Test
+    void actionWatchdogGivesSearchAndBuildToolsLongerDeadlines() {
+        assertEquals(20L * 240L, CitizenJobManager.actionTimeoutTicks("goto"));
+        assertEquals(20L * 240L, CitizenJobManager.actionTimeoutTicks("equip_item"));
+        assertEquals(20L * 240L, CitizenJobManager.actionTimeoutTicks("collect_items"));
+        assertEquals(20L * 720L, CitizenJobManager.actionTimeoutTicks("mine"));
+        assertEquals(20L * 720L, CitizenJobManager.actionTimeoutTicks("build"));
+        assertEquals(20L * 720L, CitizenJobManager.actionTimeoutTicks("fish"));
+
+        JsonObject synthesized = JsonParser.parseString(
+                CitizenJobManager.actionTimeoutResult("goto", 20L * 240L)).getAsJsonObject();
+        assertFalse(synthesized.get("success").getAsBoolean());
+        assertEquals("action_timeout", synthesized.get("code").getAsString());
+        assertTrue(synthesized.get("message").getAsString().contains("goto"));
+        assertTrue(synthesized.get("message").getAsString().contains("240 seconds"));
+        assertTrue(synthesized.get("message").getAsString().contains("job_needs_input"));
+    }
+
+    @Test
+    void transientBrainPauseReasonsMapToTheAutomaticRetryLoop() {
+        assertTrue(CitizenJobManager.isTransientBrainPauseReason(
+                "provider_unavailable: provider is busy"));
+        assertTrue(CitizenJobManager.isTransientBrainPauseReason(
+                "planning_in_progress: planning needs another pass; the job resumes automatically"));
+        assertTrue(CitizenJobManager.isProviderUnavailableReason(
+                "Provider_Unavailable: provider returned HTTP 502"));
+        assertFalse(CitizenJobManager.isProviderUnavailableReason(
+                "planning_in_progress: more passes needed"));
+        assertTrue(CitizenJobManager.isPlanningContinuationReason(
+                " planning_in_progress: continuing"));
+
+        assertFalse(CitizenJobManager.isTransientBrainPauseReason(null));
+        assertFalse(CitizenJobManager.isTransientBrainPauseReason("model-call budget exhausted"));
+        assertFalse(CitizenJobManager.isTransientBrainPauseReason(
+                "stage_budget_exhausted: stage 'chop' used its action budget"));
+        assertFalse(CitizenJobManager.isTransientBrainPauseReason("canceled"));
+    }
+
+    @Test
+    void failureNoticesComeOnlyFromExplicitlyFailedParseableResults() {
+        assertEquals(
+                "no path to target",
+                CitizenJobManager.failureMessage(
+                        "{\"success\":false,\"message\":\"no path to target\"}"));
+        assertEquals(
+                "bilinmeyen hata",
+                CitizenJobManager.failureMessage("{\"success\":false}"));
+
+        assertNull(CitizenJobManager.failureMessage(
+                "{\"success\":true,\"message\":\"done\"}"));
+        assertNull(CitizenJobManager.failureMessage("{\"data\":{}}"));
+        assertNull(CitizenJobManager.failureMessage("not json at all"));
+        assertNull(CitizenJobManager.failureMessage(null));
+        assertNull(CitizenJobManager.failureMessage("  "));
+
+        String longMessage = "x".repeat(500);
+        String bounded = CitizenJobManager.failureMessage(
+                "{\"success\":false,\"message\":\"" + longMessage + "\"}");
+        assertTrue(bounded.length() <= 160);
+    }
+
+    @Test
+    void goalSnippetStaysOneChatLine() {
+        assertEquals("chop 8 logs", CitizenJobManager.goalSnippet("  chop 8 logs  "));
+        assertEquals("", CitizenJobManager.goalSnippet(null));
+        String longGoal = "y".repeat(200);
+        String snippet = CitizenJobManager.goalSnippet(longGoal);
+        assertEquals(60, snippet.length());
+        assertTrue(snippet.endsWith("..."));
     }
 
     private static JobRecord baseJob(JobState state, JobProgress progress) {

@@ -23,6 +23,22 @@ WORLD_TOOLS = [
     {
         "type": "function",
         "function": {
+            "name": "get_self_status",
+            "description": "Report the citizen's own status and inventory.",
+            "parameters": {"type": "object", "properties": {}},
+        },
+    },
+    {
+        "type": "function",
+        "function": {
+            "name": "scan_blocks",
+            "description": "Scan nearby blocks for exact ids.",
+            "parameters": {"type": "object", "properties": {}},
+        },
+    },
+    {
+        "type": "function",
+        "function": {
             "name": "mine",
             "description": "Mine requested blocks.",
             "parameters": {
@@ -44,6 +60,22 @@ WORLD_TOOLS = [
                 "properties": {"skill": {"type": "string"}},
                 "required": ["skill"],
             },
+        },
+    },
+    {
+        "type": "function",
+        "function": {
+            "name": "transfer",
+            "description": "Move items in an open container GUI.",
+            "parameters": {"type": "object", "properties": {}},
+        },
+    },
+    {
+        "type": "function",
+        "function": {
+            "name": "interact_at",
+            "description": "Interact with a looked-at block.",
+            "parameters": {"type": "object", "properties": {}},
         },
     },
 ]
@@ -377,6 +409,115 @@ class DurableJobTest(TempDatabaseTest, unittest.TestCase):
             tool for tool in provider.calls[0][1] if tool["function"]["name"] == "job_needs_input"
         )
         self.assertIn("Never use this for an axe", needs_input["function"]["description"])
+
+    def test_gather_then_chest_chains_mine_to_storage_without_player_utterance(self) -> None:
+        provider = FakeProvider(
+            reply("mine", {"block_ids": ["minecraft:oak_log"], "count": 8}),
+        )
+        service = self.service(provider)
+        started = service.start(
+            job_payload(goal="Gather 8 wood then put it in the chest.")
+        )
+        self.assertEqual("mine", started["action"]["name"])
+        mine_id = started["action"]["id"]
+        provider.replies.append(
+            reply(
+                "job_finish",
+                {
+                    "phase": "complete",
+                    "summary": "Wood gathered.",
+                    "speech": "I punched the logs.",
+                    "evidence_action_ids": [mine_id],
+                },
+            )
+        )
+        provider.replies.append(reply("transfer", {"destination": "chest"}))
+        chained = service.result(
+            result_payload(
+                "wood-mined",
+                "job-1",
+                mine_id,
+                {"success": True, "count": 8},
+            )
+        )
+        self.assertEqual("ACTION", chained["kind"])
+        self.assertEqual("transfer", chained["action"]["name"])
+        self.assertEqual(3, len(provider.calls))
+        follow_up = json.dumps(provider.calls[-1][0], ensure_ascii=False)
+        self.assertIn("original_instruction", follow_up)
+        self.assertIn("Gather 8 wood then put it in the chest.", follow_up)
+        self.assertIn("next remaining", follow_up.lower())
+        # This goal now routes through the staged gather_wood template, so the
+        # premature job_finish is rejected by the deterministic stage gate
+        # (verify/deliver evidence is still missing) instead of the freeform
+        # instruction-policy fault; both keep the job on the original chest step.
+        self.assertIn("job_finish is rejected", follow_up)
+        self.assertIn("is not complete", follow_up)
+
+    def test_one_step_punch_can_finish_after_one_mine(self) -> None:
+        provider = FakeProvider(
+            reply("mine", {"block_ids": ["minecraft:oak_log"], "count": 1}),
+            reply("look_around", {}),
+        )
+        service = self.service(provider)
+        started = service.start(job_payload(goal="Punch that oak log."))
+        self.assertEqual("mine", started["action"]["name"])
+        mine_id = started["action"]["id"]
+        proof = service.result(
+            result_payload("punched", "job-1", mine_id, {"success": True, "count": 1})
+        )
+        self.assertEqual("look_around", proof["action"]["name"])
+        proof_id = proof["action"]["id"]
+        provider.replies.append(
+            reply(
+                "job_finish",
+                {
+                    "phase": "complete",
+                    "summary": "The oak log was punched.",
+                    "speech": "Done.",
+                    "evidence_action_ids": [mine_id, proof_id],
+                },
+            )
+        )
+        completed = service.result(
+            result_payload(
+                "verified-punch",
+                "job-1",
+                proof_id,
+                {"success": True, "observed": "air where the oak log was"},
+            )
+        )
+        self.assertEqual("COMPLETED", completed["kind"])
+
+    def test_sequence_reissue_pause_is_rejected_and_work_continues(self) -> None:
+        provider = FakeProvider(
+            reply("mine", {"block_ids": ["minecraft:oak_log"], "count": 8}),
+            reply(
+                "job_needs_input",
+                {
+                    "phase": "deposit",
+                    "summary": "Waiting for the owner.",
+                    "question": "Wood is gathered. Say continue and I will put it in the chest.",
+                },
+            ),
+            reply("interact_at", {"button": "right"}),
+        )
+        service = self.service(provider)
+        started = service.start(
+            job_payload(goal="Gather 8 wood then put it in the chest.")
+        )
+        chained = service.result(
+            result_payload(
+                "wood-mined",
+                "job-1",
+                started["action"]["id"],
+                {"success": True, "count": 8},
+            )
+        )
+        self.assertEqual("ACTION", chained["kind"])
+        self.assertEqual("interact_at", chained["action"]["name"])
+        feedback = json.dumps(provider.calls[-1][0], ensure_ascii=False)
+        self.assertIn("do not pause", feedback.lower())
 
     def test_planner_is_told_dimension_travel_is_unavailable(self) -> None:
         provider = FakeProvider(reply("look_around", {}))
@@ -1281,6 +1422,164 @@ class DurableJobTest(TempDatabaseTest, unittest.TestCase):
         assert recovered is not None
         self.assertEqual("READY", recovered.state)
         self.assertEqual(1, recovered.model_calls)
+
+
+class OutageAndLoopResilienceTest(TempDatabaseTest, unittest.TestCase):
+    """Failures the live wood-chopping cascade exposed: outages and dead loops."""
+
+    def service(self, provider, **overrides: str) -> JobService:
+        configured = settings(self.db_path, **overrides)
+        return JobService(
+            settings=configured,
+            store=SQLiteStore(configured.db_path),
+            provider=provider,
+        )
+
+    def test_provider_outage_pauses_with_retryable_reason_then_resumes(self) -> None:
+        from citizen_brain.provider import ProviderUnavailable
+
+        class OutageThenRecoverProvider(FakeProvider):
+            def __init__(self, *replies) -> None:
+                super().__init__(*replies)
+                self.outages = 1
+
+            def chat(self, messages, tools):
+                if self.outages > 0:
+                    self.outages -= 1
+                    raise ProviderUnavailable("provider is busy")
+                return super().chat(messages, tools)
+
+        provider = OutageThenRecoverProvider(reply("look_around", {}))
+        service = self.service(provider)
+        paused = service.start(job_payload(goal="Tidy the workshop area"))
+        self.assertEqual("PAUSED", paused["kind"])
+        self.assertTrue(
+            paused["reason"].startswith("provider_unavailable"),
+            paused["reason"],
+        )
+        # No planner-fault event was burned on the outage.
+        events = service.store.recent_job_events("job-1", 16)
+        self.assertNotIn("planner_error", [event["type"] for event in events])
+
+        resumed = service.resume(resume_payload("resume-1", "job-1"))
+        self.assertEqual("ACTION", resumed["kind"])
+        self.assertEqual("look_around", resumed["action"]["name"])
+
+    def test_long_planning_pauses_in_progress_and_resumes(self) -> None:
+        class SlowClock:
+            def __init__(self) -> None:
+                self.now = 1_000.0
+
+            def __call__(self) -> float:
+                return self.now
+
+        clock = SlowClock()
+
+        class SlowProvider(FakeProvider):
+            def chat(self, messages, tools):
+                clock.now += 7.0
+                return super().chat(messages, tools)
+
+        checkpoint = reply(
+            "job_checkpoint",
+            {"phase": "planning", "summary": "Thinking.", "checkpoint": {"step": 1}},
+        )
+        provider = SlowProvider(checkpoint, checkpoint)
+        configured = settings(self.db_path, CITIZENS_MAX_JOB_REQUEST_SECONDS="10")
+        service = JobService(
+            settings=configured,
+            store=SQLiteStore(configured.db_path),
+            provider=provider,
+            clock=clock,
+        )
+        paused = service.start(job_payload(goal="Organize the storage room fully"))
+        self.assertEqual("PAUSED", paused["kind"])
+        self.assertTrue(
+            paused["reason"].startswith("planning_in_progress"), paused["reason"]
+        )
+        # Two internal passes happened before the wall-clock guard fired.
+        self.assertEqual(2, len(provider.calls))
+
+        provider.replies.append(reply("look_around", {}))
+        resumed = service.resume(resume_payload("resume-continue", "job-1"))
+        self.assertEqual("ACTION", resumed["kind"])
+        self.assertEqual("look_around", resumed["action"]["name"])
+
+    def test_identical_failing_action_is_redirected_after_two_failures(self) -> None:
+        doomed = {"block_ids": ["minecraft:diamond_ore"], "count": 5}
+        provider = FakeProvider(reply("mine", doomed))
+        service = self.service(provider)
+        started = service.start(job_payload(goal="Fetch the sparkling stones"))
+        self.assertEqual("mine", started["action"]["name"])
+
+        # First failure: replanning may try the same call once more.
+        provider.replies.append(reply("look_around", {}))
+        observed = service.result(
+            result_payload(
+                "fail-1", "job-1", started["action"]["id"],
+                {"success": False, "message": "no reachable target"},
+            )
+        )
+        self.assertEqual("look_around", observed["action"]["name"])
+        provider.replies.append(reply("mine", doomed))
+        retried = service.result(
+            result_payload("see-1", "job-1", observed["action"]["id"], {"success": True})
+        )
+        self.assertEqual("mine", retried["action"]["name"])
+
+        # Second identical failure: the identical third attempt is refused and
+        # the planner is redirected; a changed approach is accepted.
+        provider.replies.append(reply("look_around", {}))
+        second_observe = service.result(
+            result_payload(
+                "fail-2", "job-1", retried["action"]["id"],
+                {"success": False, "message": "no reachable target"},
+            )
+        )
+        self.assertEqual("look_around", second_observe["action"]["name"])
+        provider.replies.append(reply("mine", doomed))
+        provider.replies.append(
+            reply("mine", {"block_ids": ["minecraft:deepslate_diamond_ore"], "count": 5})
+        )
+        redirected = service.result(
+            result_payload(
+                "see-2", "job-1", second_observe["action"]["id"], {"success": True}
+            )
+        )
+        self.assertEqual("ACTION", redirected["kind"])
+        self.assertEqual(
+            ["minecraft:deepslate_diamond_ore"],
+            redirected["action"]["arguments"]["block_ids"],
+        )
+        fault_context = json.dumps(provider.calls[-1][0], ensure_ascii=False)
+        self.assertIn("already failed", fault_context)
+        self.assertIn("job_needs_input", fault_context)
+
+    def test_insistent_identical_failure_pauses_with_the_loop_reason(self) -> None:
+        # A read-only action avoids the failed-mutation recovery gate, so the
+        # repeated-failure guard is what stops the loop.
+        provider = FakeProvider(reply("look_around", {}))
+        service = self.service(provider, CITIZENS_MAX_JOB_PLANNER_RETRIES="0")
+        started = service.start(job_payload(goal="Fetch the sparkling stones"))
+
+        provider.replies.append(reply("look_around", {}))
+        retried = service.result(
+            result_payload(
+                "fail-1", "job-1", started["action"]["id"],
+                {"success": False, "message": "sensor jammed"},
+            )
+        )
+        self.assertEqual("look_around", retried["action"]["name"])
+
+        provider.replies.append(reply("look_around", {}))
+        paused = service.result(
+            result_payload(
+                "fail-2", "job-1", retried["action"]["id"],
+                {"success": False, "message": "sensor jammed"},
+            )
+        )
+        self.assertEqual("PAUSED", paused["kind"])
+        self.assertIn("already failed", paused["reason"])
 
 
 if __name__ == "__main__":

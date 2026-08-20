@@ -2,6 +2,8 @@ package io.github.mizar107.zapegcitizens.brain;
 
 import com.dwinovo.numen.entity.NumenPlayer;
 import com.google.gson.JsonArray;
+import com.google.gson.JsonObject;
+import com.google.gson.JsonParser;
 import io.github.mizar107.zapegcitizens.ZapeGCitizens;
 import io.github.mizar107.zapegcitizens.brain.BrainProtocol.CitizenIdentity;
 import io.github.mizar107.zapegcitizens.brain.BrainProtocol.JobAction;
@@ -57,6 +59,21 @@ public final class CitizenJobManager {
     private static final long AUTO_RESUME_DEBOUNCE_TICKS = 200L;
     private static final int AUTO_RESUME_MAX_ATTEMPTS = 4;
     private static final int MAX_INVENTORY_DIFF_LENGTH = 240;
+    /**
+     * Per-action physical watchdog. A Numen task whose completion callback never
+     * arrives (unreachable goto target, exhausted mine search, dropped task) must
+     * not wedge the job in WAITING_ACTION until the multi-hour active-time budget
+     * kills it: the pending action is canceled and a machine-readable timeout
+     * failure is reported so the planner re-plans and the actor hears one line.
+     */
+    private static final long ACTION_TIMEOUT_TICKS = 20L * 240L;
+    private static final long LONG_ACTION_TIMEOUT_TICKS = 20L * 720L;
+    private static final Set<String> LONG_RUNNING_TOOLS = Set.of("mine", "build", "fish");
+    private static final long FAILURE_NOTICE_MIN_INTERVAL_TICKS = 100L;
+    private static final int MAX_WAITING_JOBS_PER_CITIZEN = 2;
+    private static final int GOAL_SNIPPET_LENGTH = 60;
+    static final String PROVIDER_UNAVAILABLE_PREFIX = "provider_unavailable";
+    static final String PLANNING_IN_PROGRESS_PREFIX = "planning_in_progress";
     private static final Set<String> READ_ONLY_TOOLS = Set.of(
             "get_self_status",
             "get_owner_status",
@@ -97,6 +114,9 @@ public final class CitizenJobManager {
     private final Map<UUID, Long> nextAutoResumeAt = new ConcurrentHashMap<>();
     private final Map<UUID, Integer> autoResumeAttempts = new ConcurrentHashMap<>();
     private final Set<UUID> autoResumeExhaustedNotified = ConcurrentHashMap.newKeySet();
+    /** Runtime-only action-watchdog and failure-notice bookkeeping. */
+    private final Map<UUID, Long> actionDispatchedAt = new ConcurrentHashMap<>();
+    private final Map<UUID, Long> lastFailureNoticeAt = new ConcurrentHashMap<>();
 
     private MinecraftServer attachedServer;
     private long lastBudgetAccountAt;
@@ -142,12 +162,15 @@ public final class CitizenJobManager {
 
         MinecraftServer server = actor.server;
         CitizenJobData data = CitizenJobData.get(server);
-        Optional<JobRecord> existing = data.activeForCitizen(citizenRecord.citizenId());
-        if (existing.isPresent()) {
-            JobRecord job = existing.orElseThrow();
-            return JobOperation.failure(
-                    citizenRecord.name() + " already has active job " + shortId(job.jobId())
-                            + " (" + job.state().name().toLowerCase(Locale.ROOT) + ").");
+        boolean waitInLine = data.activeForCitizen(citizenRecord.citizenId()).isPresent();
+        if (waitInLine) {
+            int waiting = data.waitingForCitizen(citizenRecord.citizenId()).size();
+            if (waiting >= MAX_WAITING_JOBS_PER_CITIZEN) {
+                return JobOperation.failure(
+                        citizenRecord.name() + " meşgul ve görev sırası dolu ("
+                                + MAX_WAITING_JOBS_PER_CITIZEN
+                                + " bekleyen iş). Önce birini bitirmesini bekle veya iptal et.");
+            }
         }
 
         BrainConfig settings = config.orElseThrow();
@@ -165,7 +188,11 @@ public final class CitizenJobManager {
                         settings.maxJobModelCalls(),
                         Math.toIntExact(settings.maxJobActiveTime().toSeconds())),
                 JobState.QUEUED,
-                JobProgress.queued(),
+                waitInLine
+                        ? new JobProgress(
+                                CitizenJobData.WAITING_PHASE,
+                                "Waiting for the citizen's current job to finish.")
+                        : JobProgress.queued(),
                 0,
                 0L,
                 Optional.empty(),
@@ -178,10 +205,23 @@ public final class CitizenJobManager {
         } catch (IllegalStateException exception) {
             return JobOperation.failure(cleanMessage(exception));
         }
-        if (!flushLedger(server, job, "job acceptance")) {
+        if (!flushLedger(server, job, waitInLine ? "queued job" : "job acceptance")) {
             failLocal(server, job, "the world job ledger could not be saved");
             return JobOperation.failure(
                     "The job ledger could not be saved; no work was started.");
+        }
+
+        if (waitInLine) {
+            int position = data.waitingForCitizen(citizenRecord.citizenId()).size();
+            ZapeGCitizens.LOGGER.info(
+                    "[citizen-job] queued job={} actor={} citizen={} position={}",
+                    job.jobId(), job.actorId(), job.citizenId(), position);
+            JobOperation queued = JobOperation.success(
+                    job.jobId(),
+                    citizenRecord.name() + " şu an meşgul; yeni görev sıraya alındı (#"
+                            + position + "): " + goalSnippet(goal));
+            actor.sendSystemMessage(Component.literal("[Citizens] " + queued.message()));
+            return queued;
         }
 
         ZapeGCitizens.LOGGER.info(
@@ -403,6 +443,11 @@ public final class CitizenJobManager {
                     || job.state() == JobState.PAUSED_BUDGET) {
                 continue;
             }
+            if (CitizenJobData.isWaitingInLine(job)) {
+                // Waiting-in-line jobs have no remote state to recover; the
+                // tick-time promotion starts them when their turn comes.
+                continue;
+            }
             if (job.state() == JobState.CANCELING) {
                 continueCancellation(server, job, null, "startup cancellation recovery");
                 scheduled++;
@@ -480,7 +525,7 @@ public final class CitizenJobManager {
             return;
         }
         MinecraftServer server = citizen.server;
-        CitizenJobData.get(server).activeForCitizen(citizen.getUUID())
+        CitizenJobData.get(server).activeDrivingForCitizen(citizen.getUUID())
                 .ifPresent(job -> pauseLocal(
                         server,
                         job,
@@ -492,7 +537,7 @@ public final class CitizenJobManager {
     /** Player-owned jobs pause on logout instead of losing their plan. */
     public void ownerUnavailable(MinecraftServer server, UUID ownerId) {
         for (CitizenRecord record : CitizenRegistryData.get(server).ownedBy(ownerId)) {
-            CitizenJobData.get(server).activeForCitizen(record.citizenId())
+            CitizenJobData.get(server).activeDrivingForCitizen(record.citizenId())
                     .ifPresent(job -> pauseLocal(
                             server,
                             job,
@@ -506,7 +551,7 @@ public final class CitizenJobManager {
      * Quarantines logical work without touching a live body whose technical ownership is corrupt.
      */
     public void ownershipMismatch(MinecraftServer server, UUID citizenId, String reason) {
-        CitizenJobData.get(server).activeForCitizen(citizenId).ifPresent(job -> {
+        CitizenJobData.get(server).activeDrivingForCitizen(citizenId).ifPresent(job -> {
             if (job.state() == JobState.CANCELING) {
                 continueCancellation(server, job, null, "ownership quarantine cancellation");
             } else {
@@ -570,6 +615,8 @@ public final class CitizenJobManager {
                 nextAutoResumeAt.remove(job.jobId());
                 autoResumeAttempts.remove(job.jobId());
                 autoResumeExhaustedNotified.remove(job.jobId());
+                actionDispatchedAt.remove(job.jobId());
+                lastFailureNoticeAt.remove(job.jobId());
                 continue;
             }
             if (job.state() == JobState.PAUSED_BODY || job.state() == JobState.PAUSED_OWNER) {
@@ -578,6 +625,93 @@ public final class CitizenJobManager {
                 maybeRetryBrain(server, job, now);
             } else if (job.state() == JobState.NEEDS_INPUT) {
                 maybeAutoResume(server, job, now);
+            } else if (job.state() == JobState.WAITING_ACTION) {
+                maybeTimeOutAction(server, job, now);
+            } else if (job.state() == JobState.QUEUED
+                    && !CitizenJobData.isWaitingInLine(job)
+                    && !inFlight.containsKey(job.jobId())) {
+                // A promoted or crash-orphaned initial start with no driver:
+                // resume() routes it through the idempotent /start retry once
+                // the citizen, owner, and body are available.
+                resume(server, job.jobId(), "");
+            }
+        }
+        promoteQueuedJobs(server, now);
+    }
+
+    /**
+     * Cancels and fails a physical action whose Numen completion never arrived.
+     * The synthesized failure reaches the brain as a machine-readable timeout so
+     * the planner re-plans immediately instead of the job silently sitting in
+     * WAITING_ACTION until its multi-hour active-time budget is gone.
+     */
+    private void maybeTimeOutAction(MinecraftServer server, JobRecord job, long now) {
+        PendingAction pending = job.pendingAction().orElse(null);
+        if (pending == null || pending.resultJson().isPresent()) {
+            return;
+        }
+        long startedAt = actionDispatchedAt.computeIfAbsent(job.jobId(), id -> now);
+        long timeout = actionTimeoutTicks(pending.toolName());
+        if (now - startedAt < timeout) {
+            return;
+        }
+        actionDispatchedAt.remove(job.jobId());
+        NumenToolGateway.cancelExecution(pending.executionId());
+        CitizenRecord citizenRecord = CitizenRegistryData.get(server)
+                .findByCitizenId(job.citizenId()).orElse(null);
+        if (citizenRecord != null) {
+            NumenPlayer body = NumenServerCompat.findLiveManaged(
+                    server, citizenRecord.citizenId(), citizenRecord.bodyOwnerId());
+            if (body != null) {
+                NumenToolGateway.cancelBody(body);
+            }
+        }
+        ZapeGCitizens.LOGGER.warn(
+                "[citizen-job] action watchdog canceled job={} citizen={} tool={} after {} ticks",
+                job.jobId(), job.citizenId(), pending.toolName(), now - startedAt);
+        tellActor(server, job, "[" + citizenName(server, job.citizenId())
+                + "] Bu adım çok uzun sürdü (" + pending.toolName()
+                + "); iptal edip yeniden planlıyorum.");
+        // The Turkish line above covers this failure; suppress the generic one.
+        lastFailureNoticeAt.put(job.jobId(), now);
+        onToolResult(server, job.jobId(), pending.actionId(),
+                actionTimeoutResult(pending.toolName(), timeout));
+    }
+
+    /**
+     * Starts the oldest waiting-in-line job of each citizen whose driving job
+     * has ended. Promotion only rewrites the waiting marker; the regular QUEUED
+     * initial-start path performs the availability checks and the HTTP start.
+     */
+    private void promoteQueuedJobs(MinecraftServer server, long now) {
+        CitizenJobData data = CitizenJobData.get(server);
+        Set<UUID> promotedCitizens = new TreeSet<>();
+        for (JobRecord job : data.all()) {
+            if (!CitizenJobData.isWaitingInLine(job)) {
+                continue;
+            }
+            UUID citizenId = job.citizenId();
+            if (promotedCitizens.contains(citizenId)
+                    || data.activeDrivingForCitizen(citizenId).isPresent()) {
+                continue;
+            }
+            promotedCitizens.add(citizenId);
+            JobRecord promoted = data.update(job.jobId(), current -> current.transition(
+                    JobState.QUEUED,
+                    JobProgress.queued(),
+                    current.actionsCompleted(),
+                    current.activeTicks(),
+                    current.pendingAction(),
+                    current.lastConfirmedActionId(),
+                    Optional.empty(),
+                    now)).orElseThrow();
+            ZapeGCitizens.LOGGER.info(
+                    "[citizen-job] promoting queued job={} citizen={}",
+                    promoted.jobId(), citizenId);
+            JobOperation operation = resume(server, promoted.jobId(), "");
+            if (operation.successful()) {
+                tellActor(server, promoted, "[" + citizenName(server, citizenId)
+                        + "] Sıradaki göreve başlıyorum: " + goalSnippet(promoted.goal()));
             }
         }
     }
@@ -734,6 +868,10 @@ public final class CitizenJobManager {
     /** Persist a resumable pause before Numen bodies are hibernated. */
     public void shutdown(MinecraftServer server) {
         for (JobRecord job : CitizenJobData.get(server).all()) {
+            if (CitizenJobData.isWaitingInLine(job)) {
+                // Waiting rows persist as-is and are promoted after restart.
+                continue;
+            }
             if (job.state().consumesActiveTime() || job.state() == JobState.QUEUED) {
                 pauseLocal(
                         server,
@@ -753,6 +891,8 @@ public final class CitizenJobManager {
         nextAutoResumeAt.clear();
         autoResumeAttempts.clear();
         autoResumeExhaustedNotified.clear();
+        actionDispatchedAt.clear();
+        lastFailureNoticeAt.clear();
         attachedServer = null;
     }
 
@@ -879,10 +1019,18 @@ public final class CitizenJobManager {
             pauseLocal(server, job, "the brain returned a mismatched job identity", false);
             return;
         }
-        // A valid reply proves the brain is reachable again; reset the PAUSED_BRAIN backoff.
-        nextBrainRetryAt.remove(jobId);
-        brainRetryAttempts.remove(jobId);
-        brainPauseNotified.remove(jobId);
+        // A valid reply proves the brain is reachable again; reset the PAUSED_BRAIN
+        // backoff. A provider_unavailable pause is the one valid reply that still
+        // reports an outage: keep its attempt count so a long outage stays bounded
+        // instead of retrying every backoff floor until the model-call budget dies.
+        boolean providerOutage = reply.kind() == JobReplyKind.PAUSED
+                && reply.reason().map(CitizenJobManager::isProviderUnavailableReason)
+                        .orElse(false);
+        if (!providerOutage) {
+            nextBrainRetryAt.remove(jobId);
+            brainRetryAttempts.remove(jobId);
+            brainPauseNotified.remove(jobId);
+        }
 
         if (acknowledgedActionId != null) {
             PendingAction pending = job.pendingAction().orElse(null);
@@ -936,10 +1084,20 @@ public final class CitizenJobManager {
                 String question = reply.question().orElseThrow();
                 boolean optionalTool = HarvestPolicy.isOptionalHarvestToolRequest(
                         job.goal(), question);
-                needsInput(server, job, progress, question, !optionalTool);
+                boolean sequenceReissue = InstructionPolicy.isSequenceReissueRequest(
+                        job.goal(), question);
+                needsInput(server, job, progress, question, !(optionalTool || sequenceReissue));
                 if (optionalTool) {
                     JobOperation operation = resume(
                             server, job.jobId(), HarvestPolicy.handHarvestAnswer());
+                    if (!operation.successful()) {
+                        tellActor(server, job, "[Citizens] " + operation.message());
+                    }
+                } else if (sequenceReissue) {
+                    JobOperation operation = resume(
+                            server,
+                            job.jobId(),
+                            InstructionPolicy.continueOriginalInstructionAnswer());
                     if (!operation.successful()) {
                         tellActor(server, job, "[Citizens] " + operation.message());
                     }
@@ -948,7 +1106,15 @@ public final class CitizenJobManager {
             case COMPLETED -> complete(
                     server, job, progress, reply.speech().orElseThrow());
             case PAUSED -> {
-                if (resumeAfterAcknowledgedPause) {
+                String reason = reply.reason().orElseThrow();
+                if (isTransientBrainPauseReason(reason)) {
+                    // Provider outages and long multi-pass planning are
+                    // retryable: PAUSED_BRAIN's bounded backoff re-drives the
+                    // job instead of waiting for a manual resume (and instead
+                    // of an immediate resume loop during pause recovery).
+                    pauseLocal(server, job, reason, false, progress,
+                            JobState.PAUSED_BRAIN);
+                } else if (resumeAfterAcknowledgedPause) {
                     long now = server.overworld().getGameTime();
                     CitizenJobData.get(server).update(job.jobId(), current -> current.transition(
                             JobState.PAUSED,
@@ -964,7 +1130,7 @@ public final class CitizenJobManager {
                         tellActor(server, job, "[Citizens] " + operation.message());
                     }
                 } else {
-                    pauseLocal(server, job, reply.reason().orElseThrow(), false, progress);
+                    pauseLocal(server, job, reason, false, progress);
                 }
             }
         }
@@ -1055,6 +1221,10 @@ public final class CitizenJobManager {
         autoResumeAttempts.remove(job.jobId());
         autoResumeExhaustedNotified.remove(job.jobId());
         nextAutoResumeAt.remove(job.jobId());
+        // A crash-recovered action keeps its deterministic execution id; drop any
+        // stale registration so the re-dispatch cannot fail as a duplicate.
+        NumenToolGateway.cancelExecution(executionId);
+        actionDispatchedAt.put(job.jobId(), now);
         NumenToolGateway.execute(
                 body,
                 executionId,
@@ -1077,6 +1247,7 @@ public final class CitizenJobManager {
             }
             String result = boundedResult(rawResult);
             long now = server.overworld().getGameTime();
+            actionDispatchedAt.remove(jobId);
             JobRecord reporting = CitizenJobData.get(server).update(jobId, current ->
                     current.transition(
                             JobState.REPORTING_RESULT,
@@ -1096,8 +1267,30 @@ public final class CitizenJobManager {
                         JobState.PAUSED_BRAIN);
                 return;
             }
+            maybeAnnounceFailure(server, reporting, pending.toolName(), result, now);
             reportStoredResult(server, reporting, false);
         });
+    }
+
+    /**
+     * One throttled line from the citizen itself whenever a physical step fails,
+     * so replanning is visible in chat instead of a silent stall. The brain
+     * separately receives the full machine-readable failure result.
+     */
+    private void maybeAnnounceFailure(
+            MinecraftServer server, JobRecord job, String toolName, String resultJson, long now) {
+        String message = failureMessage(resultJson);
+        if (message == null) {
+            return;
+        }
+        long previous = lastFailureNoticeAt.getOrDefault(job.jobId(), Long.MIN_VALUE / 2);
+        if (now - previous < FAILURE_NOTICE_MIN_INTERVAL_TICKS) {
+            return;
+        }
+        lastFailureNoticeAt.put(job.jobId(), now);
+        tellActor(server, job, "[" + citizenName(server, job.citizenId())
+                + "] Adım başarısız (" + toolName + "): " + message
+                + " — yeniden planlıyorum.");
     }
 
     private void needsInput(
@@ -1247,6 +1440,11 @@ public final class CitizenJobManager {
     private void notifyPause(
             MinecraftServer server, JobRecord job, JobState pauseState, String reason) {
         if (job.state() == pauseState) {
+            return;
+        }
+        // A long planning phase intentionally cycles through PAUSED_BRAIN and back;
+        // it is normal progress, never worth a chat line.
+        if (pauseState == JobState.PAUSED_BRAIN && isPlanningContinuationReason(reason)) {
             return;
         }
         // A brain outage auto-retries through RUNNING and back; announce only the first
@@ -1445,6 +1643,8 @@ public final class CitizenJobManager {
             nextAutoResumeAt.clear();
             autoResumeAttempts.clear();
             autoResumeExhaustedNotified.clear();
+            actionDispatchedAt.clear();
+            lastFailureNoticeAt.clear();
         }
     }
 
@@ -1524,6 +1724,75 @@ public final class CitizenJobManager {
 
     static boolean shouldRetryBrain(int attempts) {
         return attempts >= 0 && attempts < BRAIN_RETRY_MAX_ATTEMPTS;
+    }
+
+    /** Sidecar pause reasons that self-heal through the PAUSED_BRAIN retry loop. */
+    static boolean isTransientBrainPauseReason(String reason) {
+        return isProviderUnavailableReason(reason) || isPlanningContinuationReason(reason);
+    }
+
+    static boolean isProviderUnavailableReason(String reason) {
+        return reason != null
+                && reason.strip().toLowerCase(Locale.ROOT)
+                        .startsWith(PROVIDER_UNAVAILABLE_PREFIX);
+    }
+
+    static boolean isPlanningContinuationReason(String reason) {
+        return reason != null
+                && reason.strip().toLowerCase(Locale.ROOT)
+                        .startsWith(PLANNING_IN_PROGRESS_PREFIX);
+    }
+
+    /** Watchdog deadline for one physical action; search/build tools get longer. */
+    static long actionTimeoutTicks(String toolName) {
+        return LONG_RUNNING_TOOLS.contains(toolName)
+                ? LONG_ACTION_TIMEOUT_TICKS
+                : ACTION_TIMEOUT_TICKS;
+    }
+
+    /** Machine-readable synthesized failure for an action the watchdog canceled. */
+    static String actionTimeoutResult(String toolName, long timeoutTicks) {
+        return "{\"success\":false,\"code\":\"action_timeout\",\"message\":\"" + toolName
+                + " did not complete within " + (timeoutTicks / 20L)
+                + " seconds and was canceled by the server watchdog; the target may be"
+                + " unreachable, too far, or in unloaded chunks. Choose a nearer or"
+                + " different target or approach, or state the blocker with"
+                + " job_needs_input\"}";
+    }
+
+    /**
+     * Bounded human-readable message from an explicitly failed tool result, or
+     * {@code null} for successful or unparseable content.
+     */
+    static String failureMessage(String resultJson) {
+        if (resultJson == null || resultJson.isBlank()) {
+            return null;
+        }
+        try {
+            JsonObject root = JsonParser.parseString(resultJson).getAsJsonObject();
+            if (!root.has("success") || root.get("success").getAsBoolean()) {
+                return null;
+            }
+            String message = root.has("message") && root.get("message").isJsonPrimitive()
+                    ? root.get("message").getAsString()
+                    : "";
+            message = message.replace('\n', ' ').replace('\r', ' ').strip();
+            if (message.isEmpty()) {
+                message = "bilinmeyen hata";
+            }
+            return message.substring(0, Math.min(message.length(), 160));
+        } catch (RuntimeException ignored) {
+            return null;
+        }
+    }
+
+    /** Bounded one-line rendering of a goal for queue/promotion announcements. */
+    static String goalSnippet(String goal) {
+        String stripped = goal == null ? "" : goal.strip();
+        if (stripped.length() <= GOAL_SNIPPET_LENGTH) {
+            return stripped;
+        }
+        return stripped.substring(0, GOAL_SNIPPET_LENGTH - 3) + "...";
     }
 
     static long brainRetryDelayTicks(int attempt) {

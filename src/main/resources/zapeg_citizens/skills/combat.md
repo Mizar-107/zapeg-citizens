@@ -16,7 +16,8 @@ Use this workflow for a deliberate hunt or fight.
    nearby entity merely because the desired type was absent from a truncated scan.
 5. A quota hunt is a repeated observe/attack/verify loop. Count confirmed target deaths, not attack
    attempts or model assertions. Checkpoint the quota and inventory after every batch. Patrol or wait
-   only inside the authorized structure/area and within a bounded time budget.
+   only inside the authorized structure/area and within a bounded time budget. Keep looping until the
+   original quota is met; do not wait for the player to say continue after each attack.
 6. Recheck health and food between batches. Retreat or pause below the configured thresholds. On
    death or restart, rescan and reconcile the confirmed quota before taking another action.
 7. Completion requires postcondition evidence: requested number of the exact entity type defeated,

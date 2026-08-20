@@ -30,6 +30,12 @@ import java.util.function.UnaryOperator;
 public final class CitizenJobData extends SavedData {
 
     public static final int DATA_VERSION = 2;
+    /**
+     * Progress phase marking a job that waits in line behind another job of the
+     * same citizen. Waiting rows are the only allowed extra nonterminal rows per
+     * citizen; the manager promotes the oldest one when the driving job ends.
+     */
+    public static final String WAITING_PHASE = "queued-waiting";
     public static final int MAX_GOAL_LENGTH = 8_000;
     public static final int MAX_PHASE_LENGTH = 128;
     public static final int MAX_SUMMARY_LENGTH = 2_048;
@@ -62,6 +68,31 @@ public final class CitizenJobData extends SavedData {
                 .findFirst();
     }
 
+    /** The one nonterminal job actually driving the citizen, ignoring waiting rows. */
+    public Optional<JobRecord> activeDrivingForCitizen(UUID citizenId) {
+        Objects.requireNonNull(citizenId, "citizenId");
+        return jobs.values().stream()
+                .filter(job -> job.citizenId().equals(citizenId)
+                        && !job.state().terminal()
+                        && !isWaitingInLine(job))
+                .findFirst();
+    }
+
+    /** Oldest-first waiting jobs queued behind the citizen's driving job. */
+    public List<JobRecord> waitingForCitizen(UUID citizenId) {
+        Objects.requireNonNull(citizenId, "citizenId");
+        return jobs.values().stream()
+                .filter(job -> job.citizenId().equals(citizenId) && isWaitingInLine(job))
+                .toList();
+    }
+
+    /** True for a nonterminal job parked in line behind another job. */
+    public static boolean isWaitingInLine(JobRecord job) {
+        return job != null
+                && job.state() == JobState.QUEUED
+                && WAITING_PHASE.equals(job.progress().phase());
+    }
+
     public List<JobRecord> all() {
         return List.copyOf(jobs.values());
     }
@@ -73,13 +104,18 @@ public final class CitizenJobData extends SavedData {
                 .toList();
     }
 
-    /** Creates a job while enforcing the one-active-job-per-body invariant. */
+    /**
+     * Creates a job while enforcing the one-driving-job-per-body invariant.
+     * Waiting-in-line rows ({@link #WAITING_PHASE}) may coexist with the
+     * driving job; every other nonterminal creation stays exclusive.
+     */
     public void create(JobRecord job) {
         Objects.requireNonNull(job, "job");
         if (jobs.containsKey(job.jobId())) {
             throw new IllegalStateException("Job identity is already reserved: " + job.jobId());
         }
-        if (!job.state().terminal() && activeForCitizen(job.citizenId()).isPresent()) {
+        if (!job.state().terminal() && !isWaitingInLine(job)
+                && activeDrivingForCitizen(job.citizenId()).isPresent()) {
             throw new IllegalStateException(
                     "Citizen already has an active job: " + job.citizenId());
         }
@@ -147,7 +183,10 @@ public final class CitizenJobData extends SavedData {
             if (job == null || data.jobs.containsKey(job.jobId())) {
                 continue;
             }
-            if (!job.state().terminal() && data.activeForCitizen(job.citizenId()).isPresent()) {
+            // Waiting-in-line rows legitimately coexist with the driving job;
+            // any other duplicate nonterminal row for the citizen is dropped.
+            if (!job.state().terminal() && !isWaitingInLine(job)
+                    && data.activeDrivingForCitizen(job.citizenId()).isPresent()) {
                 continue;
             }
             data.jobs.put(job.jobId(), job);

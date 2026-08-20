@@ -84,6 +84,7 @@ class JobRecord:
     recovery_required: bool
     last_response: dict[str, Any] | None
     pause_reason: str | None
+    template: dict[str, Any] | None
     created_at: float
     updated_at: float
 
@@ -193,6 +194,7 @@ class SQLiteStore:
                     recovery_required INTEGER NOT NULL DEFAULT 0,
                     last_response_json TEXT,
                     pause_reason TEXT,
+                    template_json TEXT,
                     created_at REAL NOT NULL,
                     updated_at REAL NOT NULL
                 );
@@ -267,7 +269,7 @@ class SQLiteStore:
                     ON turns(citizen_id)
                     WHERE state IN ('calling', 'waiting_tool');
 
-                PRAGMA user_version = 5;
+                PRAGMA user_version = 6;
                 """
             )
         with closing(self._connect()) as connection:
@@ -281,6 +283,10 @@ class SQLiteStore:
                 connection.execute(
                     "ALTER TABLE jobs ADD COLUMN action_queue_json TEXT NOT NULL DEFAULT '[]'"
                 )
+            if "template_json" not in job_columns:
+                # Databases created before staged job templates existed gain the
+                # column in place; a NULL reads as "no template" (freeform job).
+                connection.execute("ALTER TABLE jobs ADD COLUMN template_json TEXT")
 
     @staticmethod
     def _dump(value: Any) -> str:
@@ -350,6 +356,11 @@ class SQLiteStore:
                 else None
             ),
             pause_reason=row["pause_reason"],
+            template=(
+                json.loads(row["template_json"])
+                if "template_json" in row.keys() and row["template_json"] is not None
+                else None
+            ),
             created_at=row["created_at"],
             updated_at=row["updated_at"],
         )
@@ -881,6 +892,7 @@ class SQLiteStore:
         budgets: dict[str, int],
         now: float,
         max_active_jobs: int,
+        template: dict[str, Any] | None = None,
     ) -> tuple[bool, JobRecord]:
         connection = self._connect()
         try:
@@ -944,8 +956,8 @@ class SQLiteStore:
                 INSERT INTO jobs (
                     job_id, request_id, input_hash, citizen_id, actor_id,
                     citizen_json, actor_json, goal, tools_json, budgets_json,
-                    state, created_at, updated_at
-                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 'READY', ?, ?)
+                    state, template_json, created_at, updated_at
+                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 'READY', ?, ?, ?)
                 """,
                 (
                     job_id,
@@ -958,6 +970,7 @@ class SQLiteStore:
                     goal,
                     self._dump(tools),
                     self._dump(budgets),
+                    self._dump(template) if template is not None else None,
                     now,
                     now,
                 ),
@@ -1114,6 +1127,94 @@ class SQLiteStore:
                 }
             )
         return actions
+
+    def recent_failed_actions(self, job_id: str, limit: int) -> list[dict[str, Any]]:
+        """Most recent confirmed results joined with their requested arguments.
+
+        Returns the newest ``limit`` result events (oldest first), each carrying
+        the action name, the exact arguments from the matching 'action' event,
+        and whether the result succeeded. Used to detect an identical action
+        failing repeatedly so the planner is redirected instead of looping.
+        """
+        if limit <= 0:
+            return []
+        with closing(self._connect()) as connection:
+            rows = connection.execute(
+                """
+                SELECT id, action_id, payload_json,
+                       (
+                           SELECT payload_json FROM job_events requested
+                            WHERE requested.job_id = job_events.job_id
+                              AND requested.event_type = 'action'
+                              AND requested.action_id = job_events.action_id
+                       ) AS action_payload_json
+                  FROM (
+                    SELECT id, job_id, action_id, payload_json
+                      FROM job_events
+                     WHERE job_id = ? AND event_type = 'result' AND action_id IS NOT NULL
+                     ORDER BY id DESC LIMIT ?
+                  ) AS job_events ORDER BY id ASC
+                """,
+                (job_id, limit),
+            ).fetchall()
+        actions: list[dict[str, Any]] = []
+        for row in rows:
+            payload = json.loads(row["payload_json"])
+            result_content = payload.get("result")
+            arguments: Any = None
+            if row["action_payload_json"] is not None:
+                try:
+                    arguments = json.loads(row["action_payload_json"]).get("arguments")
+                except (json.JSONDecodeError, TypeError, AttributeError):
+                    arguments = None
+            actions.append(
+                {
+                    "event_id": int(row["id"]),
+                    "action_id": row["action_id"],
+                    "action_name": payload.get("action_name"),
+                    "arguments": arguments,
+                    "success": isinstance(result_content, str)
+                    and _successful_tool_result(result_content),
+                }
+            )
+        return actions
+
+    def update_job_template(
+        self,
+        *,
+        job_id: str,
+        template: dict[str, Any],
+        event_type: str,
+        payload: dict[str, Any],
+        now: float,
+    ) -> JobRecord:
+        """Persist deterministic template/stage state and journal the transition."""
+        connection = self._connect()
+        try:
+            connection.execute("BEGIN IMMEDIATE")
+            self._job_row(connection, job_id)
+            connection.execute(
+                """
+                INSERT INTO job_events(job_id, event_type, payload_json, created_at)
+                VALUES (?, ?, ?, ?)
+                """,
+                (job_id, event_type, self._dump(payload), now),
+            )
+            connection.execute(
+                """
+                UPDATE jobs SET template_json = ?, revision = revision + 1, updated_at = ?
+                 WHERE job_id = ?
+                """,
+                (self._dump(template), now, job_id),
+            )
+            updated = self._job_row(connection, job_id)
+            connection.commit()
+            return self._job_record(updated)
+        except BaseException:
+            connection.rollback()
+            raise
+        finally:
+            connection.close()
 
     def begin_job_model_call(self, job_id: str, *, now: float) -> JobRecord:
         connection = self._connect()

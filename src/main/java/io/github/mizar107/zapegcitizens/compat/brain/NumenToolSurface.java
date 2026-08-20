@@ -30,7 +30,14 @@ final class NumenToolSurface {
             truthful = truthful
                     + " Logs, wood, and other vanilla hand-breakable blocks can be punched with "
                     + "empty hands. An axe is optional speed, never a blocker. Equip an axe only "
-                    + "when one is already in inventory, then mine.";
+                    + "when one is already in inventory, then mine. Call equip_best_tool with the "
+                    + "target block_id first to equip the best carried tool automatically.";
+        }
+        if ("goto".equals(toolName)) {
+            truthful = truthful
+                    + " Movement is on foot within the current dimension only. Very distant or "
+                    + "unloaded destinations fail or time out; prefer staged waypoints within a "
+                    + "few hundred blocks and verify arrival with get_self_status.";
         }
         return truthful;
     }

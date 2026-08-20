@@ -6,7 +6,7 @@ import threading
 import time
 import unittest
 
-from citizen_brain.provider import OllamaChatProvider, ProviderError
+from citizen_brain.provider import OllamaChatProvider, ProviderError, ProviderUnavailable
 
 
 class FakeResponse:
@@ -147,6 +147,78 @@ class OllamaChatProviderTest(unittest.TestCase):
 
         self.assertFalse(first.is_alive(), "first provider call must not deadlock")
         self.assertEqual([], first_errors)
+
+    def test_transport_failures_are_classified_as_unavailable(self) -> None:
+        # Queue-slot exhaustion is transient capacity, not a planner fault.
+        opener = BlockingOpener()
+        provider = OllamaChatProvider(
+            url="http://ollama/api/chat",
+            model="model",
+            api_key=None,
+            timeout_seconds=5,
+            max_response_bytes=4096,
+            queue_timeout_seconds=0.03,
+            concurrency=1,
+            opener=opener,
+        )
+        first = threading.Thread(
+            target=lambda: provider.chat([{"role": "user", "content": "a"}], [])
+        )
+        first.start()
+        try:
+            self.assertTrue(opener.entered.wait(timeout=1))
+            with self.assertRaises(ProviderUnavailable):
+                provider.chat([{"role": "user", "content": "b"}], [])
+        finally:
+            opener.release.set()
+            first.join(timeout=1)
+
+        # An undecodable provider body is a provider-side outage as well.
+        class GarbageOpener:
+            def open(self, request, timeout: int):  # noqa: ANN001, ANN201
+                response = FakeResponse({})
+                response.data = b"\xff\xfe not json"
+                return response
+
+        garbage = OllamaChatProvider(
+            url="http://ollama/api/chat",
+            model="model",
+            api_key=None,
+            timeout_seconds=5,
+            max_response_bytes=4096,
+            opener=GarbageOpener(),
+        )
+        with self.assertRaises(ProviderUnavailable):
+            garbage.chat([{"role": "user", "content": "x"}], [])
+
+    def test_reply_shape_faults_stay_plain_provider_errors(self) -> None:
+        # A malformed tool call is model behavior the planner retry loop can
+        # feed back and correct; it must NOT look like a transport outage.
+        opener = RecordingOpener(
+            {
+                "message": {
+                    "role": "assistant",
+                    "content": "",
+                    "tool_calls": [{"function": {"name": "", "arguments": {}}}],
+                }
+            }
+        )
+        provider = OllamaChatProvider(
+            url="http://ollama/api/chat",
+            model="model",
+            api_key=None,
+            timeout_seconds=5,
+            max_response_bytes=4096,
+            opener=opener,
+        )
+        try:
+            provider.chat([{"role": "user", "content": "x"}], [])
+        except ProviderUnavailable:  # pragma: no cover - would be a regression
+            self.fail("reply-shape faults must not be ProviderUnavailable")
+        except ProviderError:
+            pass
+        else:  # pragma: no cover - would be a regression
+            self.fail("invalid tool call must raise ProviderError")
 
     def test_redirect_is_rejected_without_forwarding_authorization(self) -> None:
         target_authorization: list[str | None] = []

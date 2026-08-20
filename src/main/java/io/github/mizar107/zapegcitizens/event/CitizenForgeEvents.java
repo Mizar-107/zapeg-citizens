@@ -241,20 +241,15 @@ public final class CitizenForgeEvents {
                         "[Citizens] " + record.name() + " has no paused job to resume."));
                 return;
             }
-            if (activeJob != null) {
-                if (isResume(address.prompt())) {
-                    JobOperation operation = jobs.resume(actor.server, record, "");
-                    actor.sendSystemMessage(Component.literal(
-                            "[Citizens] " + operation.message()));
-                    return;
-                }
+            if (activeJob != null && isResume(address.prompt())) {
+                JobOperation operation = jobs.resume(actor.server, record, "");
                 actor.sendSystemMessage(Component.literal(
-                        "[Citizens] " + record.name() + " already has "
-                                + jobs.formatStatus(activeJob)
-                                + ". Use @" + record.name() + " status or @"
-                                + record.name() + " stop."));
+                        "[Citizens] " + operation.message()));
                 return;
             }
+            // Any other prompt while a job is active is a NEW goal: submit()
+            // queues it behind the current job (bounded) and announces the
+            // position, instead of rejecting the request outright.
         }
 
         NumenPlayer citizen = NumenServerCompat.findLiveManaged(

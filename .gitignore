@@ -9,3 +9,5 @@ out/
 *.iws
 bin/
 logs/
+
+zapeg-build-log.txt

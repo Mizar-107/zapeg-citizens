@@ -117,6 +117,60 @@ class CitizenJobDataTest {
     }
 
     @Test
+    void waitingInLineJobsCoexistWithTheDrivingJobAndSurviveReload() {
+        CitizenJobData data = new CitizenJobData();
+        UUID citizenId = UUID.randomUUID();
+        JobRecord driving = job(UUID.randomUUID(), citizenId, JobState.RUNNING);
+        data.create(driving);
+
+        JobRecord waiting = job(UUID.randomUUID(), citizenId, JobState.QUEUED)
+                .transition(
+                        JobState.QUEUED,
+                        new JobProgress(
+                                CitizenJobData.WAITING_PHASE,
+                                "Waiting for the citizen's current job to finish."),
+                        0,
+                        0,
+                        Optional.empty(),
+                        Optional.empty(),
+                        Optional.empty(),
+                        120);
+        data.create(waiting);
+        assertTrue(CitizenJobData.isWaitingInLine(waiting));
+        assertEquals(driving.jobId(), data.activeForCitizen(citizenId).orElseThrow().jobId());
+        assertEquals(
+                driving.jobId(),
+                data.activeDrivingForCitizen(citizenId).orElseThrow().jobId());
+        assertEquals(1, data.waitingForCitizen(citizenId).size());
+
+        // A second non-waiting nonterminal job stays forbidden.
+        assertThrows(IllegalStateException.class,
+                () -> data.create(job(UUID.randomUUID(), citizenId, JobState.QUEUED)));
+
+        // Both rows survive the save/load round trip; only true duplicates drop.
+        CitizenJobData reloaded = CitizenJobData.load(data.save(new CompoundTag()));
+        assertEquals(2, reloaded.forCitizen(citizenId).size());
+        assertEquals(1, reloaded.waitingForCitizen(citizenId).size());
+        assertEquals(
+                driving.jobId(),
+                reloaded.activeDrivingForCitizen(citizenId).orElseThrow().jobId());
+
+        // Once the driving job ends, the waiting row is the next active job.
+        reloaded.update(driving.jobId(), current -> current.transition(
+                JobState.COMPLETED,
+                current.progress(),
+                current.actionsCompleted(),
+                current.activeTicks(),
+                Optional.empty(),
+                current.lastConfirmedActionId(),
+                Optional.of("done"),
+                500));
+        assertTrue(reloaded.activeDrivingForCitizen(citizenId).isEmpty());
+        assertEquals(
+                waiting.jobId(), reloaded.activeForCitizen(citizenId).orElseThrow().jobId());
+    }
+
+    @Test
     void transitionCannotReplaceJobOrCitizenIdentity() {
         CitizenJobData data = new CitizenJobData();
         JobRecord active = job(UUID.randomUUID(), UUID.randomUUID(), JobState.RUNNING);
