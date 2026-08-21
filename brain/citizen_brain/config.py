@@ -86,6 +86,7 @@ class Settings:
     max_job_internal_steps: int
     max_job_planner_retries: int
     max_job_request_seconds: int
+    village_memory_file: str | None
 
     @classmethod
     def from_env(cls, env: Mapping[str, str] | None = None) -> "Settings":
@@ -186,5 +187,11 @@ class Settings:
             # three sidecar values must keep their sum below the mod timeout.
             max_job_request_seconds=_integer(
                 values, "CITIZENS_MAX_JOB_REQUEST_SECONDS", 100, 10, 570
+            ),
+            # Optional server-authored shared lore for SERVER-owned citizens
+            # (Muhtar's "memory cards"). Path only; the service loads and
+            # validates the content fail-closed at startup.
+            village_memory_file=(
+                values.get("CITIZENS_VILLAGE_MEMORY_FILE", "").strip() or None
             ),
         )
