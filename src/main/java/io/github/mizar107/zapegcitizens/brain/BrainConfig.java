@@ -111,7 +111,12 @@ public record BrainConfig(
                 uri,
                 token,
                 Duration.ofMillis(boundedInt("CITIZENS_BRAIN_CONNECT_TIMEOUT_MS", 3_000, 250, 30_000)),
-                Duration.ofMillis(boundedInt("CITIZENS_BRAIN_REQUEST_TIMEOUT_MS", 150_000, 1_000, 600_000)),
+                // Must exceed the brain's worst-case single job pass:
+                // CITIZENS_MAX_JOB_REQUEST_SECONDS (100) bounds planning-loop
+                // *entry*, so one final pass adds the provider queue wait (20)
+                // plus the provider socket timeout (90) ≈ 210 s. 300 s keeps
+                // ~90 s of headroom (the brain's test_config guards the sum).
+                Duration.ofMillis(boundedInt("CITIZENS_BRAIN_REQUEST_TIMEOUT_MS", 300_000, 1_000, 600_000)),
                 Duration.ofMillis(boundedInt("CITIZENS_BRAIN_TURN_TIMEOUT_MS", 600_000, 30_000, 86_400_000)),
                 boundedInt("CITIZENS_BRAIN_MAX_TOOL_STEPS", 16, 1, 64),
                 boundedInt("CITIZENS_JOB_MAX_ACTIONS", 128, 1, 4_096),

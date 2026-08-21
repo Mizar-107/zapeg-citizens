@@ -14,7 +14,16 @@ A player-owned worker starts work through ordinary addressed chat:
 @Atlas sort every chest around here into building blocks, ores, food, gear, and misc; add overflow chests if needed
 @Atlas status
 @Atlas stop
+@Atlas cancel
 ```
+
+`stop` (Turkish `dur`) means stand down completely: it cancels the job the citizen is working
+on AND clears every queued job with one announcement ("Tamam, her şeyi bırakıyorum.") — the
+queue can no longer promote a replacement seconds after the player said stop. `cancel`
+(Turkish `iptal`) cancels only the current job; the next queued job then promotes
+automatically and announces itself ("Sıradaki göreve başlıyorum: ..."). `/citizen stop
+<name>` behaves like the player `stop`. All keywords match case-insensitively including
+Turkish `İ/ı` (so `DUR` and `İptal` work).
 
 An operator assigns a physical job to a server-owned citizen:
 
@@ -35,10 +44,13 @@ A requirement pause also watches the citizen's hands. While a job waits in `NEED
 periodically diffs the body inventory against the snapshot taken when the requirement was declared.
 When the contents change — the owner tosses over an axe, for instance — the job resumes itself once
 with a server-authenticated description of the change as the answer, says so in chat
-(“Got new supplies (+1x minecraft:iron_axe) — continuing.”), and the planner verifies the
+(“Yeni malzeme geldi (+1x minecraft:iron_axe) — devam ediyorum.”), and the planner verifies the
 requirement with read-only tools before spending more actions. Auto-resume is debounced and bounded
-to four attempts per requirement; after that the job waits for a manual answer and reminds the owner
-how to give one. A fresh requirement after real progress re-arms the budget.
+to four attempts per requirement: the counter re-arms only when a distinct new requirement is
+declared or when a mutating action proves the previous one was satisfied — the read-only
+verification step itself never re-arms it, so a drip of irrelevant inventory changes (tossed junk,
+nearby drops auto-picked-up) burns at most four resumes and then the job waits for a manual answer
+and reminds the owner how to give one.
 
 At submission, the mod records the actor's dimension, position, rotation, and looked-at block.
 Words such as “here,” “this plot,” and “these chests” therefore have a stable server-authenticated
@@ -95,9 +107,22 @@ inventory auto-resume then continues the job when the owner tosses supplies over
 transitions are deterministic server code driven by confirmed successful results, each stage has
 its own bounded action budget, the model plans only within the current stage, completion stays
 gated on the final stage, and stage state persists with the job so restarts resume mid-stage.
+The gather/mine act stages are additionally quantity-gated: the server records the citizen's
+item counts at stage start (from the latest journaled inventory-bearing result) and advances
+only when confirmed possession evidence shows the requested amount was actually gained — "64
+odun topla" can no longer complete after six logs. Two documented limitations: these payloads
+carry no item NBT, so enchanted/named variants count as their plain id, and if no inventory
+snapshot exists before the stage starts, pre-owned stock counts once first observed (the
+survey/preflight stage prompts an initial `get_self_status` precisely to establish that
+baseline).
 
 Each citizen runs exactly one job; new requests while busy are queued (up to two waiting, with a
-queue-position announcement) and start automatically when the current job ends. A per-action
+queue-position announcement) and start automatically when the current job ends. A job that
+exhausts its action, model-call, or active-time budget — whichever side enforces it — parks as
+`PAUSED_BUDGET`: it cannot resume (there is no budget top-up command; cancel is the only way to
+clear it), it no longer blocks the citizen, and the next queued job starts automatically past it.
+Stage templates are different: their per-stage budget pause (`stage_budget_exhausted`) is
+resumable, and an explicit resume grants the stage another action window. A per-action
 watchdog bounds every physical step (4 minutes; 12 for mine/build/fish): a Numen task whose
 completion never arrives is canceled and reported to the planner as a machine-readable
 `action_timeout` failure instead of freezing the job until its multi-hour budget dies. Every
@@ -142,6 +167,21 @@ arguments for a detailed compact structure plan; other tools keep the 16 KiB cap
   so an autonomous Overworld-to-Nether-and-back expedition is not promised yet. Asked to fetch
   Nether-only resources such as glowstone from the Overworld, the citizen now refuses the crossing
   out loud and states what it would need instead of silently searching.
+
+## Players, claims, and combat limits
+
+- **No PvP by proxy:** `melee_attack` and `ranged_attack` are refused server-side whenever their
+  arguments resolve to a connected real player (by exact name, UUID, or entity id). The citizen
+  answers with a machine-readable `player_target_denied` failure and the Turkish line
+  "Oyunculara saldıramam; bu hedef gerçek bir oyuncu." — no matter whether the planner chose the
+  target itself or the owner asked for it. The guard matches exact identity tokens only; it does
+  not evaluate free-text descriptions, and other citizens' bodies are not covered by it.
+- **Land claims (documented caveat, not yet enforced):** the tool boundary has no claim/protection
+  awareness — no FTB Chunks dependency exists in this tree. Depending on how Numen's block
+  operations interact with protection mods, a citizen directed into a foreign claim either grieves
+  it or deny-loops against it (bounded by the repeated-failure guard, but reported confusingly).
+  Until a claim precondition ships, verify the direction on a copied world first and do not point
+  citizens at claimed areas; treat every job as operating only on the owner's own territory.
 
 Test long jobs on a copied world before relying on them in the live ATM9 world. The durable journal
 protects control flow and recovery; it cannot make an unreachable block, missing tool, unloaded ore,

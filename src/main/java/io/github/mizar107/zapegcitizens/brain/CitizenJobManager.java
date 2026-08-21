@@ -56,6 +56,8 @@ public final class CitizenJobManager {
     private static final long BRAIN_RETRY_BASE_TICKS = 100L;
     private static final long BRAIN_RETRY_MAX_TICKS = 1_200L;
     private static final int BRAIN_RETRY_MAX_ATTEMPTS = 6;
+    /** After the exponential backoff is exhausted, cancel retries drop to five minutes. */
+    private static final long CANCEL_RETRY_SLOW_TICKS = 6_000L;
     private static final long AUTO_RESUME_DEBOUNCE_TICKS = 200L;
     private static final int AUTO_RESUME_MAX_ATTEMPTS = 4;
     private static final int MAX_INVENTORY_DIFF_LENGTH = 240;
@@ -74,6 +76,9 @@ public final class CitizenJobManager {
     private static final int GOAL_SNIPPET_LENGTH = 60;
     static final String PROVIDER_UNAVAILABLE_PREFIX = "provider_unavailable";
     static final String PLANNING_IN_PROGRESS_PREFIX = "planning_in_progress";
+    static final String STAGE_BUDGET_PREFIX = "stage_budget_exhausted";
+    /** Brain 409 code meaning "healthy, still planning" — never an outage. */
+    static final String JOB_IN_PROGRESS_CODE = "job_in_progress";
     private static final Set<String> READ_ONLY_TOOLS = Set.of(
             "get_self_status",
             "get_owner_status",
@@ -106,16 +111,19 @@ public final class CitizenJobManager {
     private final Set<UUID> brainPauseNotified = ConcurrentHashMap.newKeySet();
     /**
      * Runtime-only auto-resume bookkeeping for NEEDS_INPUT jobs: the inventory snapshot taken
-     * when the requirement was declared, plus debounce and bounded-attempt state. None of this
-     * is persisted; after a restart the first tick simply re-baselines the snapshot.
+     * when the requirement was declared, plus debounce state and the per-requirement bounded
+     * attempt budget. None of this is persisted; after a restart the first tick simply
+     * re-baselines the snapshot.
      */
     private final Map<UUID, Map<String, Integer>> needsInputInventoryBaseline =
             new ConcurrentHashMap<>();
     private final Map<UUID, Long> nextAutoResumeAt = new ConcurrentHashMap<>();
-    private final Map<UUID, Integer> autoResumeAttempts = new ConcurrentHashMap<>();
+    private final AutoResumeBudget autoResumeBudget =
+            new AutoResumeBudget(AUTO_RESUME_MAX_ATTEMPTS);
     private final Set<UUID> autoResumeExhaustedNotified = ConcurrentHashMap.newKeySet();
-    /** Runtime-only action-watchdog and failure-notice bookkeeping. */
+    /** Runtime-only action-watchdog, cancel-retry, and failure-notice bookkeeping. */
     private final Map<UUID, Long> actionDispatchedAt = new ConcurrentHashMap<>();
+    private final Map<UUID, Integer> cancelRetryAttempts = new ConcurrentHashMap<>();
     private final Map<UUID, Long> lastFailureNoticeAt = new ConcurrentHashMap<>();
 
     private MinecraftServer attachedServer;
@@ -230,14 +238,26 @@ public final class CitizenJobManager {
         startRemote(server, job, citizenRecord, false);
         JobOperation accepted = JobOperation.success(
                 job.jobId(),
-                "Job " + shortId(job.jobId()) + " accepted for " + citizenRecord.name() + ".");
+                citizenRecord.name() + " görevi kabul etti (" + shortId(job.jobId()) + ").");
         actor.sendSystemMessage(Component.literal("[Citizens] " + accepted.message()));
         return accepted;
     }
 
     /** Returns the active job for a citizen without contacting the model. */
     public Optional<JobRecord> status(MinecraftServer server, UUID citizenId) {
-        return CitizenJobData.get(server).activeForCitizen(citizenId);
+        return controllable(server, citizenId);
+    }
+
+    /**
+     * The job a player command should address: the driving job when one exists,
+     * otherwise the oldest other nonterminal row (a budget-parked or waiting
+     * one), so parked jobs remain reachable for status and cancellation without
+     * shadowing live work.
+     */
+    private static Optional<JobRecord> controllable(MinecraftServer server, UUID citizenId) {
+        CitizenJobData data = CitizenJobData.get(server);
+        Optional<JobRecord> driving = data.activeDrivingForCitizen(citizenId);
+        return driving.isPresent() ? driving : data.activeForCitizen(citizenId);
     }
 
     public Optional<JobRecord> find(MinecraftServer server, UUID jobId) {
@@ -254,9 +274,7 @@ public final class CitizenJobManager {
      */
     public JobOperation cancel(
             MinecraftServer server, CitizenRecord citizenRecord, String requestedReason) {
-        JobRecord job = CitizenJobData.get(server)
-                .activeForCitizen(citizenRecord.citizenId())
-                .orElse(null);
+        JobRecord job = controllable(server, citizenRecord.citizenId()).orElse(null);
         if (job == null) {
             return JobOperation.failure(citizenRecord.name() + " has no active job.");
         }
@@ -290,14 +308,59 @@ public final class CitizenJobManager {
                 job.jobId(), "Cancellation requested for job " + shortId(job.jobId()) + ".");
     }
 
+    /**
+     * "Stop" means stand down completely: cancels the job the citizen is
+     * working on AND terminally cancels every waiting-in-line row, so the queue
+     * cannot promote a replacement seconds after the player said stop. Waiting
+     * rows are brain-unknown (their remote start happens only at promotion), so
+     * they are canceled locally without a remote handshake; only the
+     * driving/parked job goes through the durable CANCELING acknowledgement.
+     * The player hears one Turkish line; "cancel"/"iptal" keeps the
+     * one-job-at-a-time semantics through {@link #cancel} instead.
+     */
+    public JobOperation stopAll(
+            MinecraftServer server, CitizenRecord citizenRecord, String requestedReason) {
+        CitizenJobData data = CitizenJobData.get(server);
+        String reason = boundedReason(requestedReason, "stopped by its owner");
+        long now = server.overworld().getGameTime();
+        List<JobRecord> waiting = data.waitingForCitizen(citizenRecord.citizenId());
+        for (JobRecord waitingJob : waiting) {
+            data.update(waitingJob.jobId(), current -> current.transition(
+                    JobState.CANCELED,
+                    current.progress(),
+                    current.actionsCompleted(),
+                    current.activeTicks(),
+                    current.pendingAction(),
+                    current.lastConfirmedActionId(),
+                    Optional.of(reason),
+                    now));
+            ZapeGCitizens.LOGGER.info(
+                    "[citizen-job] stop cleared waiting job={} citizen={}",
+                    waitingJob.jobId(), citizenRecord.citizenId());
+        }
+        if (!waiting.isEmpty()) {
+            flushLedger(server, waiting.get(0), "stop cleared the waiting queue");
+        }
+        JobRecord active = controllable(server, citizenRecord.citizenId()).orElse(null);
+        if (active == null) {
+            return waiting.isEmpty()
+                    ? JobOperation.failure(citizenRecord.name() + " has no active job.")
+                    : JobOperation.success(
+                            waiting.get(0).jobId(), "Tamam, her şeyi bırakıyorum.");
+        }
+        JobOperation cancellation = cancel(server, citizenRecord, reason);
+        if (!cancellation.successful()) {
+            return cancellation;
+        }
+        return JobOperation.success(cancellation.jobId(), "Tamam, her şeyi bırakıyorum.");
+    }
+
     /** Resume a paused/input-blocked job. A nonblank answer satisfies NEEDS_INPUT. */
     public JobOperation resume(
             MinecraftServer server,
             CitizenRecord citizenRecord,
             String answer) {
-        JobRecord job = CitizenJobData.get(server)
-                .activeForCitizen(citizenRecord.citizenId())
-                .orElse(null);
+        JobRecord job = controllable(server, citizenRecord.citizenId()).orElse(null);
         if (job == null) {
             return JobOperation.failure(citizenRecord.name() + " has no resumable job.");
         }
@@ -411,7 +474,7 @@ public final class CitizenJobManager {
      * Targeted login/body-recovery hook. It never reconciles or disturbs a live WAITING_ACTION job.
      */
     public JobOperation resumeEligible(MinecraftServer server, UUID citizenId) {
-        JobRecord job = CitizenJobData.get(server).activeForCitizen(citizenId).orElse(null);
+        JobRecord job = CitizenJobData.get(server).activeDrivingForCitizen(citizenId).orElse(null);
         if (job == null) {
             return JobOperation.failure("The citizen has no active job.");
         }
@@ -613,9 +676,10 @@ public final class CitizenJobManager {
                 brainPauseNotified.remove(job.jobId());
                 needsInputInventoryBaseline.remove(job.jobId());
                 nextAutoResumeAt.remove(job.jobId());
-                autoResumeAttempts.remove(job.jobId());
+                autoResumeBudget.clear(job.jobId());
                 autoResumeExhaustedNotified.remove(job.jobId());
                 actionDispatchedAt.remove(job.jobId());
+                cancelRetryAttempts.remove(job.jobId());
                 lastFailureNoticeAt.remove(job.jobId());
                 continue;
             }
@@ -680,8 +744,11 @@ public final class CitizenJobManager {
 
     /**
      * Starts the oldest waiting-in-line job of each citizen whose driving job
-     * has ended. Promotion only rewrites the waiting marker; the regular QUEUED
-     * initial-start path performs the availability checks and the HTTP start.
+     * has ended — or is parked by an exhausted budget ({@code PAUSED_BUDGET}
+     * counts as terminal for scheduling; the parked row stays visible until
+     * canceled). Promotion only rewrites the waiting marker; the regular
+     * QUEUED initial-start path performs the availability checks and the HTTP
+     * start.
      */
     private void promoteQueuedJobs(MinecraftServer server, long now) {
         CitizenJobData data = CitizenJobData.get(server);
@@ -727,13 +794,13 @@ public final class CitizenJobManager {
         if (http == null || inFlight.containsKey(job.jobId())) {
             return;
         }
-        int attempts = autoResumeAttempts.getOrDefault(job.jobId(), 0);
+        int attempts = autoResumeBudget.attempts(job.jobId());
         if (!shouldAttemptAutoResume(attempts)) {
             if (autoResumeExhaustedNotified.add(job.jobId())) {
                 tellActor(server, job, "[Citizens] " + citizenName(server, job.citizenId())
-                        + " still needs an answer for job " + shortId(job.jobId())
-                        + ": " + job.message().orElse("requirement unmet")
-                        + " Reply with " + answerHint(server, job) + ".");
+                        + " hâlâ bir cevap bekliyor (görev " + shortId(job.jobId())
+                        + "): " + job.message().orElse("gereksinim karşılanmadı")
+                        + " Şöyle cevapla: " + answerHint(server, job) + ".");
             }
             return;
         }
@@ -761,7 +828,7 @@ public final class CitizenJobManager {
         }
         needsInputInventoryBaseline.put(job.jobId(), current);
         nextAutoResumeAt.put(job.jobId(), now + AUTO_RESUME_DEBOUNCE_TICKS);
-        autoResumeAttempts.put(job.jobId(), attempts + 1);
+        autoResumeBudget.recordAttempt(job.jobId());
         String change = describeInventoryChange(baseline, current);
         String answer = "The citizen's inventory changed while paused: " + change + ".";
         if (HarvestPolicy.isOptionalHarvestToolRequest(job.goal(), job.message().orElse(""))
@@ -774,7 +841,7 @@ public final class CitizenJobManager {
         JobOperation operation = resume(server, job.jobId(), answer);
         if (operation.successful()) {
             tellActor(server, job, "[" + citizenName(server, job.citizenId())
-                    + "] Got new supplies (" + change + ") — continuing.");
+                    + "] Yeni malzeme geldi (" + change + ") — devam ediyorum.");
         } else {
             ZapeGCitizens.LOGGER.debug(
                     "[citizen-job] auto-resume deferred job={} reason={}",
@@ -884,12 +951,13 @@ public final class CitizenJobManager {
         inFlight.clear();
         cancelInFlight.clear();
         nextCancelRetryAt.clear();
+        cancelRetryAttempts.clear();
         nextBrainRetryAt.clear();
         brainRetryAttempts.clear();
         brainPauseNotified.clear();
         needsInputInventoryBaseline.clear();
         nextAutoResumeAt.clear();
-        autoResumeAttempts.clear();
+        autoResumeBudget.clearAll();
         autoResumeExhaustedNotified.clear();
         actionDispatchedAt.clear();
         lastFailureNoticeAt.clear();
@@ -1012,6 +1080,23 @@ public final class CitizenJobManager {
         }
 
         if (error != null) {
+            if (isStillPlanningError(error)) {
+                // 409 job_in_progress is the healthy signature of a long
+                // planning pass (the brain answered!), not an outage: refund
+                // the bounded retry attempt this probe consumed and park the
+                // job back in the silent planning-continuation wait — no
+                // "brain unreachable" announcement.
+                brainRetryAttempts.computeIfPresent(
+                        jobId, (id, value) -> value > 1 ? value - 1 : null);
+                pauseLocal(
+                        server,
+                        job,
+                        PLANNING_IN_PROGRESS_PREFIX
+                                + ": the brain is still planning this job",
+                        false,
+                        JobState.PAUSED_BRAIN);
+                return;
+            }
             pauseLocal(server, job, friendlyError(error), false, JobState.PAUSED_BRAIN);
             return;
         }
@@ -1114,6 +1199,13 @@ public final class CitizenJobManager {
                     // of an immediate resume loop during pause recovery).
                     pauseLocal(server, job, reason, false, progress,
                             JobState.PAUSED_BRAIN);
+                } else if (isBudgetExhaustedReason(reason)) {
+                    // The sidecar's budget stops mirror the mod's own
+                    // enforcement: park the job as PAUSED_BUDGET so the queue
+                    // promotes past it and the advice says "cancel", never a
+                    // resume that would just re-pause with the same reason.
+                    pauseLocal(server, job, reason, false, progress,
+                            JobState.PAUSED_BUDGET);
                 } else if (resumeAfterAcknowledgedPause) {
                     long now = server.overworld().getGameTime();
                     CitizenJobData.get(server).update(job.jobId(), current -> current.transition(
@@ -1217,10 +1309,15 @@ public final class CitizenJobManager {
                 "[citizen-job] action job={} citizen={} index={} tool={} read_only={}",
                 job.jobId(), job.citizenId(), job.actionsCompleted() + 1,
                 action.name(), pending.readOnly());
-        // Real progress re-arms the auto-resume budget for the next requirement pause.
-        autoResumeAttempts.remove(job.jobId());
-        autoResumeExhaustedNotified.remove(job.jobId());
-        nextAutoResumeAt.remove(job.jobId());
+        // Only a MUTATING action is real progress past the last declared
+        // requirement. The mandated read-only verification after every
+        // auto-resume answer must not re-arm the bounded budget, or a junk-item
+        // drip would reset the counter every resume→verify→needs_input cycle
+        // and burn the whole job budget with zero work.
+        if (autoResumeBudget.actionDispatched(job.jobId(), pending.readOnly())) {
+            autoResumeExhaustedNotified.remove(job.jobId());
+            nextAutoResumeAt.remove(job.jobId());
+        }
         // A crash-recovered action keeps its deterministic execution id; drop any
         // stale registration so the re-dispatch cannot fail as a duplicate.
         NumenToolGateway.cancelExecution(executionId);
@@ -1314,6 +1411,13 @@ public final class CitizenJobManager {
                 current.lastConfirmedActionId(),
                 Optional.of(question),
                 now));
+        // A DISTINCT new requirement legitimately re-arms the bounded auto-resume
+        // budget; the same question re-declared after a verification pass keeps
+        // its counter so the 4-attempt cap actually binds per requirement.
+        if (autoResumeBudget.declareRequirement(job.jobId(), question)) {
+            autoResumeExhaustedNotified.remove(job.jobId());
+            nextAutoResumeAt.remove(job.jobId());
+        }
         // Re-baseline the inventory watch so the auto-resume reacts to what arrives
         // after this requirement was declared, not to earlier contents.
         CitizenRecord citizenRecord = CitizenRegistryData.get(server)
@@ -1541,7 +1645,13 @@ public final class CitizenJobManager {
         if (cancelInFlight.putIfAbsent(job.jobId(), generation) != null) {
             return;
         }
-        nextCancelRetryAt.put(job.jobId(), server.overworld().getGameTime() + 100L);
+        // Bounded churn while the brain is down: exponential backoff like the
+        // resume retries, then a slow five-minute cadence. CANCELING itself
+        // stays durable — only the retry frequency decays.
+        int attempt = cancelRetryAttempts.merge(job.jobId(), 1, Integer::sum) - 1;
+        nextCancelRetryAt.put(
+                job.jobId(),
+                server.overworld().getGameTime() + cancelRetryDelayTicks(attempt));
         CompletableFuture<JobReply> future;
         try {
             future = http.cancelJob(
@@ -1582,6 +1692,7 @@ public final class CitizenJobManager {
                         reply.progress().phase(), reply.progress().summary());
                 complete(server, current, progress, reply.speech().orElseThrow());
                 nextCancelRetryAt.remove(job.jobId());
+                cancelRetryAttempts.remove(job.jobId());
                 return;
             }
             if (reply.kind() != JobReplyKind.PAUSED) {
@@ -1603,6 +1714,7 @@ public final class CitizenJobManager {
                             now)).orElseThrow();
             flushLedger(server, canceled, "cancellation acknowledgement");
             nextCancelRetryAt.remove(job.jobId());
+            cancelRetryAttempts.remove(job.jobId());
             tellActor(server, canceled,
                     "[Citizens] Job " + shortId(job.jobId()) + " is canceled.");
         }));
@@ -1636,12 +1748,13 @@ public final class CitizenJobManager {
             inFlight.clear();
             cancelInFlight.clear();
             nextCancelRetryAt.clear();
+            cancelRetryAttempts.clear();
             nextBrainRetryAt.clear();
             brainRetryAttempts.clear();
             brainPauseNotified.clear();
             needsInputInventoryBaseline.clear();
             nextAutoResumeAt.clear();
-            autoResumeAttempts.clear();
+            autoResumeBudget.clearAll();
             autoResumeExhaustedNotified.clear();
             actionDispatchedAt.clear();
             lastFailureNoticeAt.clear();
@@ -1743,6 +1856,43 @@ public final class CitizenJobManager {
                         .startsWith(PLANNING_IN_PROGRESS_PREFIX);
     }
 
+    /**
+     * Sidecar pause reasons ("action/model-call/active-time budget exhausted")
+     * that mirror the mod's own budget stop and must park the job as
+     * PAUSED_BUDGET. A template's {@code stage_budget_exhausted} is explicitly
+     * excluded: an explicit resume legitimately re-arms a stage window.
+     */
+    static boolean isBudgetExhaustedReason(String reason) {
+        if (reason == null) {
+            return false;
+        }
+        String normalized = reason.strip().toLowerCase(Locale.ROOT);
+        return !normalized.startsWith(STAGE_BUDGET_PREFIX)
+                && normalized.contains("budget exhausted");
+    }
+
+    /**
+     * True when a failed brain round-trip is the healthy 409
+     * {@code job_in_progress} reply — the brain answered and still holds the
+     * job mid-planning. Never an outage: no announcement, no attempt burn.
+     */
+    static boolean isStillPlanningError(Throwable error) {
+        Throwable current = error;
+        while (current instanceof CompletionException && current.getCause() != null) {
+            current = current.getCause();
+        }
+        return current instanceof BrainHttpClient.BrainRequestException requestException
+                && requestException.statusCode() == 409
+                && JOB_IN_PROGRESS_CODE.equals(requestException.errorCode());
+    }
+
+    /** Cancel retries reuse the brain backoff, then settle at a slow cadence. */
+    static long cancelRetryDelayTicks(int attempt) {
+        return attempt >= BRAIN_RETRY_MAX_ATTEMPTS
+                ? CANCEL_RETRY_SLOW_TICKS
+                : brainRetryDelayTicks(Math.max(0, attempt));
+    }
+
     /** Watchdog deadline for one physical action; search/build tools get longer. */
     static long actionTimeoutTicks(String toolName) {
         return LONG_RUNNING_TOOLS.contains(toolName)
@@ -1780,7 +1930,13 @@ public final class CitizenJobManager {
             if (message.isEmpty()) {
                 message = "bilinmeyen hata";
             }
-            return message.substring(0, Math.min(message.length(), 160));
+            int limit = Math.min(message.length(), 160);
+            // Never split a surrogate pair at the truncation boundary (an emoji
+            // in model text would otherwise render as one broken character).
+            if (limit < message.length() && Character.isHighSurrogate(message.charAt(limit - 1))) {
+                limit--;
+            }
+            return message.substring(0, limit);
         } catch (RuntimeException ignored) {
             return null;
         }
@@ -1801,12 +1957,26 @@ public final class CitizenJobManager {
         return Math.min(scaled, BRAIN_RETRY_MAX_TICKS);
     }
 
-    private static String boundedResult(String result) {
+    static String boundedResult(String result) {
         String safe = result == null ? "null" : result;
         if (safe.length() <= CitizenJobData.MAX_ACTION_RESULT_LENGTH) {
             return safe;
         }
-        return "{\"success\":false,\"message\":\"tool result exceeded the durable job limit\"}";
+        // An oversized read-out (a huge scan) is still a completed action:
+        // preserve its success flag so the queue is not discarded and the
+        // citizen does not announce a failure, and tell the planner how to
+        // retry the query smaller instead of pretending the step failed.
+        boolean successful = false;
+        try {
+            JsonObject root = JsonParser.parseString(safe).getAsJsonObject();
+            successful = root.has("success") && root.get("success").getAsBoolean();
+        } catch (RuntimeException ignored) {
+            // Unparseable oversized content stays a failure.
+        }
+        return "{\"success\":" + successful + ",\"truncated\":true,\"message\":\"the tool"
+                + " result exceeded the durable job limit and its content was discarded;"
+                + " repeat the query with a smaller radius or narrower filter if the"
+                + " content is needed\"}";
     }
 
     private static String boundedReason(String reason, String fallback) {

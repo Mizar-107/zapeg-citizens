@@ -15,10 +15,14 @@ and anything else stays a freeform job with unchanged behavior.
 
 from __future__ import annotations
 
+import json
 import re
 from typing import Any, Mapping
 
-TEMPLATE_VERSION = 1
+# Version 2 added the "inventory_delta" advance kind (quantity-gated stages).
+# Evaluation dispatches on each stage's advance.kind, so persisted version-1
+# templates with only "successful_action" stages keep working unchanged.
+TEMPLATE_VERSION = 2
 
 # Ore families the mine_ore template knows how to translate into exact block ids.
 ORE_BLOCKS: dict[str, list[str]] = {
@@ -30,6 +34,19 @@ ORE_BLOCKS: dict[str, list[str]] = {
     "emerald": ["minecraft:emerald_ore", "minecraft:deepslate_emerald_ore"],
     "redstone": ["minecraft:redstone_ore", "minecraft:deepslate_redstone_ore"],
     "lapis": ["minecraft:lapis_ore", "minecraft:deepslate_lapis_ore"],
+}
+
+# Inventory item ids that count as possession evidence per mined ore family:
+# the ordinary drop plus the ore blocks themselves (silk touch / raw blocks).
+ORE_DROP_ITEMS: dict[str, list[str]] = {
+    "iron": ["minecraft:raw_iron", *ORE_BLOCKS["iron"]],
+    "coal": ["minecraft:coal", *ORE_BLOCKS["coal"]],
+    "copper": ["minecraft:raw_copper", *ORE_BLOCKS["copper"]],
+    "gold": ["minecraft:raw_gold", *ORE_BLOCKS["gold"]],
+    "diamond": ["minecraft:diamond", *ORE_BLOCKS["diamond"]],
+    "emerald": ["minecraft:emerald", *ORE_BLOCKS["emerald"]],
+    "redstone": ["minecraft:redstone", *ORE_BLOCKS["redstone"]],
+    "lapis": ["minecraft:lapis_lazuli", *ORE_BLOCKS["lapis"]],
 }
 
 _TURKISH_ORES = {
@@ -171,6 +188,34 @@ def _stage(
     }
 
 
+def _delta_stage(
+    name: str,
+    goal: str,
+    items: list[str],
+    *,
+    count: int,
+    max_actions: int = 8,
+) -> dict[str, Any]:
+    """One quantity-gated stage.
+
+    The stage exits only on deterministic possession evidence: confirmed
+    successful results must show that the citizen gained at least ``count``
+    matching items since the stage began (see ``_delta_condition_satisfied_at``).
+    ``items`` entries are exact ids (``minecraft:coal``) or family suffixes
+    (``_log``).
+    """
+    return {
+        "name": name,
+        "goal": goal,
+        "max_actions": max_actions,
+        "advance": {
+            "kind": "inventory_delta",
+            "items": list(items),
+            "count": count,
+        },
+    }
+
+
 def _wrap(name: str, params: dict[str, Any], stages: list[dict[str, Any]]) -> dict[str, Any]:
     return {
         "version": TEMPLATE_VERSION,
@@ -201,13 +246,17 @@ def _gather_wood_template(count: int) -> dict[str, Any]:
                 ["scan_blocks", "look_around", "mine"],
                 max_actions=6,
             ),
-            _stage(
+            _delta_stage(
                 "chop",
                 f"Mine {count} NEW log blocks (the exact '*_log' ids observed nearby; "
                 f"punching with empty hands is valid). Prefer one mine call with "
                 f"count={count}; mine paths to targets and collects its own drops. Use "
-                "collect_items only for leftover drops.",
-                ["mine"],
+                "collect_items only for leftover drops. The server advances this "
+                f"stage only when confirmed inventory evidence shows {count} newly "
+                "gained '*_log' items, so after mining call get_self_status to prove "
+                "the new count; if it is short, keep mining.",
+                ["_log"],
+                count=count,
                 max_actions=12,
             ),
             _stage(
@@ -241,14 +290,18 @@ def _mine_ore_template(ore: str, count: int) -> dict[str, Any]:
                 ["get_self_status", "mine"],
                 max_actions=6,
             ),
-            _stage(
+            _delta_stage(
                 "mine",
                 f"Mine {count} new {ore} ore. Use one mine call listing every variant id: "
                 f"{', '.join(blocks)}. A no-target result means the loaded area is "
                 "exhausted: move through bounded search sectors with goto, rescan with "
                 "scan_blocks, and retry; state the blocker with job_needs_input if the "
-                "area is truly exhausted.",
-                ["mine"],
+                "area is truly exhausted. The server advances this stage only when "
+                f"confirmed inventory evidence shows {count} newly gained {ore} "
+                "drops/ore items, so after mining call get_self_status to prove the "
+                "new count; if it is short, keep mining.",
+                ORE_DROP_ITEMS[ore],
+                count=count,
                 max_actions=14,
             ),
             _stage(
@@ -403,6 +456,147 @@ def is_final_complete(template: Mapping[str, Any]) -> bool:
     return template.get("completed") is True
 
 
+# Only these tools' successful results may carry possession evidence, and only
+# inside inventory-context subtrees within them. A scan_blocks result listing
+# visible world blocks must never count as items the citizen owns.
+_DELTA_EVIDENCE_ACTIONS = frozenset(
+    {"get_self_status", "mine", "collect_items", "take_items", "fish"}
+)
+_INVENTORY_CONTEXT_KEYS = frozenset(
+    {
+        "inventory",
+        "items",
+        "collected",
+        "collected_items",
+        "drops",
+        "gained",
+        "hotbar",
+        "backpack",
+        "main_inventory",
+        "offhand",
+    }
+)
+_ITEM_ID = re.compile(r"[a-z0-9_.-]+:[a-z0-9_./-]+")
+
+
+def _collect_item_counts(
+    value: Any, counts: dict[str, int], in_context: bool
+) -> None:
+    if isinstance(value, dict):
+        if in_context:
+            identifier = value.get("id") or value.get("item") or value.get("name")
+            amount = value.get("count", value.get("amount"))
+            if (
+                isinstance(identifier, str)
+                and _ITEM_ID.fullmatch(identifier)
+                and type(amount) is int
+                and amount > 0
+            ):
+                counts[identifier] = counts.get(identifier, 0) + amount
+        for key, sub in value.items():
+            if (
+                in_context
+                and isinstance(key, str)
+                and _ITEM_ID.fullmatch(key)
+                and type(sub) is int
+                and sub > 0
+            ):
+                counts[key] = counts.get(key, 0) + sub
+            child_context = in_context or (
+                isinstance(key, str) and key.lower() in _INVENTORY_CONTEXT_KEYS
+            )
+            if isinstance(sub, (dict, list)):
+                _collect_item_counts(sub, counts, child_context)
+    elif isinstance(value, list):
+        for sub in value:
+            _collect_item_counts(sub, counts, in_context)
+
+
+def _extract_item_counts(result_json: Any) -> dict[str, int]:
+    """Item-id → count evidence from one result payload.
+
+    Handles both mapping form (``{"inventory": {"minecraft:oak_log": 6}}``) and
+    record form (``{"collected": [{"item": "minecraft:oak_log", "count": 6}]}``).
+    Item NBT is not represented in these payloads, so enchanted/named variants
+    count as their plain id (the documented NBT-ignore limitation).
+    """
+    counts: dict[str, int] = {}
+    _collect_item_counts(result_json, counts, False)
+    return counts
+
+
+def _inventory_extractions(
+    confirmed_actions: list[Mapping[str, Any]],
+) -> list[tuple[int, dict[str, int]]]:
+    """Ordered (event_id, counts) pairs from evidence-bearing successful results."""
+    extractions: list[tuple[int, dict[str, int]]] = []
+    for item in confirmed_actions:
+        if not item.get("success"):
+            continue
+        if item.get("action_name") not in _DELTA_EVIDENCE_ACTIONS:
+            continue
+        raw = item.get("result")
+        if not isinstance(raw, str):
+            continue
+        try:
+            parsed = json.loads(raw)
+        except (json.JSONDecodeError, TypeError):
+            continue
+        counts = _extract_item_counts(parsed)
+        if counts:
+            extractions.append((int(item.get("event_id") or 0), counts))
+    return extractions
+
+
+def _item_matches(item_id: str, patterns: list[str]) -> bool:
+    for pattern in patterns:
+        if ":" in pattern:
+            if item_id == pattern:
+                return True
+        elif item_id.endswith(pattern):
+            return True
+    return False
+
+
+def _delta_condition_satisfied_at(
+    stage: Mapping[str, Any],
+    confirmed_actions: list[Mapping[str, Any]],
+    started_event: int,
+) -> int | None:
+    """Quantity gate: (current - stage-start baseline) >= count for the family.
+
+    The baseline is the latest extraction recorded at or before the stage's
+    start; later extractions are candidates. Per item id only gains count
+    (``max(0, current - baseline)``), so consuming one variant can never mint
+    credit for another. With no pre-stage snapshot the baseline is empty and
+    pre-owned items would count once observed — the survey/preflight stages
+    therefore instruct an initial get_self_status, which establishes the
+    baseline in the normal flow (documented limitation otherwise).
+    """
+    advance = stage.get("advance") or {}
+    patterns = [
+        pattern
+        for pattern in (advance.get("items") or ())
+        if isinstance(pattern, str) and pattern
+    ]
+    needed = int(advance.get("count") or 1)
+    if not patterns:
+        return None
+    baseline: dict[str, int] = {}
+    for event_id, counts in _inventory_extractions(confirmed_actions):
+        if event_id <= started_event:
+            baseline = counts
+            continue
+        gained = sum(
+            max(0, count - baseline.get(item_id, 0))
+            for item_id, count in counts.items()
+            if _item_matches(item_id, patterns)
+        )
+        if gained >= needed:
+            return event_id
+    return None
+
+
 def _condition_satisfied_at(
     stage: Mapping[str, Any],
     confirmed_actions: list[Mapping[str, Any]],
@@ -416,6 +610,8 @@ def _condition_satisfied_at(
     before an earlier stage's satisfaction point can never satisfy a later one.
     """
     advance = stage.get("advance") or {}
+    if advance.get("kind") == "inventory_delta":
+        return _delta_condition_satisfied_at(stage, confirmed_actions, started_event)
     if advance.get("kind") != "successful_action":
         return None
     names = set(advance.get("names") or ())

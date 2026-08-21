@@ -43,10 +43,32 @@ class SettingsTest(unittest.TestCase):
         self.assertEqual(8, configured.max_job_recent_events)
         self.assertEqual(8, configured.max_job_internal_steps)
         self.assertEqual(2, configured.max_job_planner_retries)
-        # Stays below the mod's default 150s request timeout so multi-pass
+        # Stays well below the mod's default request timeout so multi-pass
         # planning yields a retryable planning_in_progress pause instead of a
         # mod-side timeout.
         self.assertEqual(100, configured.max_job_request_seconds)
+
+    def test_default_worst_case_job_pass_stays_inside_the_mod_timeout(self) -> None:
+        # CIT-02 guard. The planning loop bounds loop entry, not the final
+        # pass, so one /v1/job request can take up to
+        # max_job_request_seconds + llm_queue_timeout + llm_timeout. That sum
+        # must stay below the mod's CITIZENS_BRAIN_REQUEST_TIMEOUT_MS default
+        # (300 000 ms in BrainConfig.java / docs/deployment.md) with headroom,
+        # or long planning strands jobs in PAUSED_BRAIN.
+        configured = Settings.from_env(
+            {
+                "CITIZENS_LLM_MODEL": "model",
+                "CITIZENS_BRAIN_TOKEN": "token",
+            }
+        )
+        mod_request_timeout_seconds = 300
+        worst_case_seconds = (
+            configured.max_job_request_seconds
+            + configured.llm_queue_timeout_seconds
+            + configured.llm_timeout_seconds
+        )
+        self.assertEqual(210, worst_case_seconds)
+        self.assertLessEqual(worst_case_seconds, mod_request_timeout_seconds - 60)
 
     def test_job_request_seconds_is_bounded_below_the_mod_timeout_cap(self) -> None:
         configured = Settings.from_env(

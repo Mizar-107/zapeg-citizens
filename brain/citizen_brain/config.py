@@ -175,6 +175,15 @@ class Settings:
             # CITIZENS_BRAIN_REQUEST_TIMEOUT_MS so multi-step planning yields a
             # retryable "planning_in_progress" pause instead of a mod-side
             # timeout that strands the job in PAUSED_BRAIN.
+            #
+            # Guard (checked by test_config): the loop bounds only loop *entry*,
+            # so the worst case for one request is this deadline plus one final
+            # pass that squeaked in just under it: queue-slot wait
+            # (CITIZENS_LLM_QUEUE_TIMEOUT_SECONDS, 20) + provider socket timeout
+            # (CITIZENS_LLM_TIMEOUT_SECONDS, 90) = 100 + 20 + 90 = 210 seconds.
+            # The mod-side CITIZENS_BRAIN_REQUEST_TIMEOUT_MS default is 300 000,
+            # so the defaults keep ~90 seconds of headroom. Raising any of the
+            # three sidecar values must keep their sum below the mod timeout.
             max_job_request_seconds=_integer(
                 values, "CITIZENS_MAX_JOB_REQUEST_SECONDS", 100, 10, 570
             ),

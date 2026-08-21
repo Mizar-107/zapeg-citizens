@@ -1581,6 +1581,163 @@ class OutageAndLoopResilienceTest(TempDatabaseTest, unittest.TestCase):
         self.assertEqual("PAUSED", paused["kind"])
         self.assertIn("already failed", paused["reason"])
 
+    def test_needs_input_ping_pong_costs_two_model_calls_per_cycle(self) -> None:
+        # CIT-01 characterization: every auto-resume answer that does not truly
+        # satisfy the requirement costs one model call to plan the verification
+        # and one to re-declare the same requirement. The brain survives the
+        # drip indefinitely; the bounded 4-attempt cap lives mod-side
+        # (AutoResumeBudget), which is why it must not re-arm on the
+        # verification dispatch.
+        question = {
+            "phase": "materials",
+            "summary": "Materials are missing.",
+            "question": "I still need 96 oak planks and 12 iron ingots before building.",
+        }
+        provider = FakeProvider(reply("job_needs_input", dict(question)))
+        service = self.service(provider)
+        blocked = service.start(job_payload(goal="Build a villa here."))
+        self.assertEqual("NEEDS_INPUT", blocked["kind"])
+
+        cycles = 3
+        for cycle in range(cycles):
+            provider.replies.append(reply("get_self_status", {}))
+            resumed = service.resume(
+                resume_payload(
+                    f"resume-drip-{cycle}",
+                    "job-1",
+                    answer="The citizen's inventory changed while paused: "
+                    "+1x minecraft:rotten_flesh.",
+                    actions_completed=cycle,
+                )
+            )
+            self.assertEqual("ACTION", resumed["kind"])
+            self.assertEqual("get_self_status", resumed["action"]["name"])
+            provider.replies.append(reply("job_needs_input", dict(question)))
+            blocked = service.result(
+                result_payload(
+                    f"drip-result-{cycle}",
+                    "job-1",
+                    resumed["action"]["id"],
+                    {"success": True, "inventory": {"minecraft:rotten_flesh": cycle + 1}},
+                )
+            )
+            self.assertEqual("NEEDS_INPUT", blocked["kind"])
+
+        # One initial pass plus exactly two model calls per unproductive cycle.
+        self.assertEqual(1 + 2 * cycles, len(provider.calls))
+        stored = service.store.get_job("job-1")
+        assert stored is not None
+        self.assertEqual("NEEDS_INPUT", stored.state)
+
+    def test_budget_pause_resume_is_deterministic_and_burns_no_model_call(self) -> None:
+        # CIT-07: a budget-exhausted pause must not become a resume/advice loop:
+        # resuming re-pauses with the same machine-mappable reason and consumes
+        # no provider call, so the mod can park it as PAUSED_BUDGET.
+        provider = FakeProvider(reply("mine", {"count": 1}))
+        service = self.service(provider)
+        first = service.start(job_payload(max_model_calls=1))
+        paused = service.result(
+            result_payload("budget-r1", "job-1", first["action"]["id"], {"success": True})
+        )
+        self.assertEqual("PAUSED", paused["kind"])
+        self.assertIn("budget exhausted", paused["reason"])
+
+        calls_before = len(provider.calls)
+        resumed = service.resume(
+            resume_payload(
+                "budget-resume", "job-1", answer="keep going", actions_completed=1
+            )
+        )
+        self.assertEqual("PAUSED", resumed["kind"])
+        self.assertIn("budget exhausted", resumed["reason"])
+        self.assertEqual(calls_before, len(provider.calls))
+
+    def test_calling_conflicts_and_cancel_fence_have_distinct_codes(self) -> None:
+        # CIT-08 contract: "still planning" is 409 job_in_progress on every
+        # operation, machine-distinguishable from the cancel-tombstone fence.
+        provider = FakeProvider(reply("look_around", {}))
+        service = self.service(provider)
+        started = service.start(job_payload())
+        service.store.accept_job_result(
+            job_id="job-1",
+            request_id="calling-setup-result",
+            action_id=started["action"]["id"],
+            input_hash="calling-setup-hash",
+            result_content='{"success":true}',
+            now=1.0,
+        )
+        service.store.begin_job_model_call("job-1", now=2.0)
+
+        with self.assertRaises(ApiError) as start_raised:
+            service.start(job_payload())
+        self.assertEqual(409, start_raised.exception.status)
+        self.assertEqual("job_in_progress", start_raised.exception.code)
+
+        with self.assertRaises(ApiError) as resume_raised:
+            service.resume(resume_payload("resume-while-calling", "job-1"))
+        self.assertEqual(409, resume_raised.exception.status)
+        self.assertEqual("job_in_progress", resume_raised.exception.code)
+
+        canceled = service.cancel(
+            {
+                "protocol": 3,
+                "request_id": "fence-cancel",
+                "job_id": "job-9",
+                "reason": "stop",
+            }
+        )
+        self.assertEqual("PAUSED", canceled["kind"])
+        with self.assertRaises(ApiError) as fenced:
+            service.start(job_payload("late-start", "job-9"))
+        self.assertEqual(409, fenced.exception.status)
+        self.assertEqual("job_not_ready", fenced.exception.code)
+        self.assertNotEqual("job_in_progress", fenced.exception.code)
+        self.assertIn("canceled", fenced.exception.message)
+
+    def test_accept_commit_then_crash_drops_queue_and_never_double_dispatches(self) -> None:
+        # A crash between accept_job_result's commit and the queue-head pop must
+        # resume into a fresh model ask with the stale queue discarded — the
+        # queued head is never blindly re-dispatched.
+        batch = ProviderReply(
+            content="",
+            assistant_message={"role": "assistant", "content": ""},
+            tool_calls=(
+                ProviderToolCall("look_around", {}),
+                ProviderToolCall("mine", {"block_ids": ["minecraft:oak_log"], "count": 2}),
+            ),
+        )
+        provider = FakeProvider(batch)
+        service = self.service(provider)
+        started = service.start(job_payload())
+        self.assertEqual("look_around", started["action"]["name"])
+
+        transition = service.store.accept_job_result(
+            job_id="job-1",
+            request_id="crash-result",
+            action_id=started["action"]["id"],
+            input_hash="crash-window-hash",
+            result_content='{"success":true}',
+            now=2.0,
+        )
+        self.assertEqual("READY", transition.job.state)
+        self.assertEqual(1, len(transition.job.action_queue))
+
+        configured = settings(self.db_path)
+        restarted_provider = FakeProvider(reply("scan_blocks", {}))
+        restarted = JobService(
+            settings=configured,
+            store=SQLiteStore(configured.db_path),
+            provider=restarted_provider,
+        )
+        response = restarted.resume(
+            resume_payload("crash-resume", "job-1", actions_completed=1)
+        )
+        self.assertEqual("ACTION", response["kind"])
+        self.assertEqual("scan_blocks", response["action"]["name"])
+        job = restarted.store.get_job("job-1")
+        assert job is not None
+        self.assertEqual([], job.action_queue)
+
 
 if __name__ == "__main__":
     unittest.main()

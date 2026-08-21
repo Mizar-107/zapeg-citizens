@@ -2,11 +2,20 @@
 
 The planner cannot finish after the first successful mine, or pause to ask the
 actor to re-issue an implied later step such as craft, deposit, or continue.
+
+The keyword nets are bilingual (the live server speaks Turkish): storage goals
+also match "sandık/depo" forms, craft goals also match "üret/craftla", and the
+re-issue net also matches "devam de", "... edeyim mi", and "seni bekliyorum"
+phrasings. Matching runs over :func:`citizen_brain.textfold.fold` output, so
+``İ``/``I``/``ı`` all compare as a plain ``i`` and the patterns are written in
+that folded form (``sandik``, ``hazir``).
 """
 
 from __future__ import annotations
 
 import re
+
+from .textfold import fold
 
 PREMATURE_FINISH_FAULT = (
     "job_finish is rejected because the original instruction still has implied "
@@ -34,10 +43,13 @@ CRAFT_TOOLS = frozenset({"craft"})
 
 _STORAGE_GOAL = re.compile(
     r"\b(chests?|barrels?|shulkers?|containers?|deposit|store|stash|"
-    r"put (it|them|this|those|the \w+) (in|into|inside))\b",
+    r"put (it|them|this|those|the \w+) (in|into|inside)|"
+    r"sandi(?:k|ğ|g)\w*|depo\w*|fiçi\w*|fici\w*|istifle\w*)\b",
     re.IGNORECASE,
 )
-_CRAFT_GOAL = re.compile(r"\bcraft(s|ing|ed)?\b", re.IGNORECASE)
+_CRAFT_GOAL = re.compile(
+    r"\b(craft(s|ing|ed)?|craftla\w*|üret\w*|uret\w*)\b", re.IGNORECASE
+)
 _REISSUE = re.compile(
     r"\b("
     r"now (continue|craft|deposit|put|store)|"
@@ -46,7 +58,13 @@ _REISSUE = re.compile(
     r"waiting for (you|the (owner|player))|"
     r"should i (continue|proceed|put|deposit|craft|store|keep going)|"
     r"do you want me to (continue|put|deposit|craft)|"
-    r"ready for (the )?next"
+    r"ready for (the )?next|"
+    r"devam (de|der misin|dersen|komutu)|"
+    r"devam etmemi (söyle|soyle|iste|ister)\w*|"
+    r"(devam|koymami|craftlamami|depolamami) ister misin\w*|"
+    r"(edeyim|koyayim|yapayim|craftlayayim|depolayayim|başlayayim|baslayayim) mi\b|"
+    r"(seni|onayini|komutunu?) bekliyorum|"
+    r"sonraki (adim|görev|gorev)[^.]{0,12}hazir\w*"
     r")\b",
     re.IGNORECASE,
 )
@@ -67,7 +85,7 @@ def premature_finish_fault(
     goal: str | None, confirmed_actions: list[dict] | None
 ) -> str | None:
     """Reject job_finish when implied later steps still lack a matching action."""
-    goal_text = goal or ""
+    goal_text = fold(goal)
     names = _successful_names(confirmed_actions)
     if _STORAGE_GOAL.search(goal_text) and names.isdisjoint(STORAGE_MOVE_TOOLS):
         return PREMATURE_FINISH_FAULT
@@ -79,6 +97,6 @@ def premature_finish_fault(
 def sequence_reissue_fault(goal: str | None, question: str | None) -> str | None:
     """Reject job_needs_input that asks the actor to re-issue an implied step."""
     _ = goal
-    if _REISSUE.search(question or ""):
+    if _REISSUE.search(fold(question)):
         return SEQUENCE_REISSUE_FAULT
     return None

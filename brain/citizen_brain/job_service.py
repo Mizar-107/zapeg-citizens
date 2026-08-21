@@ -1453,6 +1453,14 @@ class JobService:
     def _store_error(error: StoreError) -> ApiError:
         mapping = {
             "job_not_found": (404, "job_not_found", "job does not exist"),
+            # Still-planning collisions always surface as job_in_progress so the
+            # mod can machine-distinguish "healthy, still thinking" (no outage
+            # announcement, no retry-attempt burn) from real conflicts.
+            "job_calling": (
+                409,
+                "job_in_progress",
+                "job operation is still waiting for the model",
+            ),
             "job_id_reused": (409, "job_id_reused", "job_id was used for another input"),
             "job_request_reused": (
                 409,

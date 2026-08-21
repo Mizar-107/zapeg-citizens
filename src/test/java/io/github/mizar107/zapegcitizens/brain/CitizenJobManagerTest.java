@@ -228,6 +228,122 @@ class CitizenJobManagerTest {
     }
 
     @Test
+    void turkishKeywordNetsMatchTheLiveAxePausePhrase() {
+        // Regression for the live wood-chopping failure, in Turkish: the model
+        // pauses a "topla odun" job asking for a balta (axe).
+        assertTrue(HarvestPolicy.isOptionalHarvestToolRequest(
+                "8 odun topla", "Bir balta lazım"));
+        // Case-insensitive including Turkish İ/ı folding and suffixed forms.
+        assertTrue(HarvestPolicy.isOptionalHarvestToolRequest(
+                "8 ODUN TOPLA", "BALTAYA İHTİYACIM VAR"));
+        assertTrue(HarvestPolicy.isOptionalHarvestToolRequest(
+                "kütük kes ve getir", "Baltam yok, bana bir balta atar mısın?"));
+        // A Turkish pickaxe requirement stays a real blocker.
+        assertFalse(HarvestPolicy.isOptionalHarvestToolRequest(
+                "20 demir cevheri kaz", "Bir kazma gerekiyor."));
+        // Turkish re-issue phrasings are answered server-side.
+        assertTrue(InstructionPolicy.isSequenceReissueRequest(
+                "8 odun topla ve sandığa koy",
+                "Odunları topladım. Devam etmemi ister misin?"));
+        assertTrue(InstructionPolicy.isSequenceReissueRequest(
+                "8 odun topla ve sandığa koy", "Sandığa koyayım mı?"));
+        assertFalse(InstructionPolicy.isSequenceReissueRequest(
+                "bir barınak yap", "Hangi ağaç türünü kullanayım, meşe mi huş mu?"));
+    }
+
+    @Test
+    void sidecarBudgetStopsParkTheJobButStageBudgetStaysResumable() {
+        assertTrue(CitizenJobManager.isBudgetExhaustedReason("action budget exhausted"));
+        assertTrue(CitizenJobManager.isBudgetExhaustedReason("model-call budget exhausted"));
+        assertTrue(CitizenJobManager.isBudgetExhaustedReason(
+                "  Active-Time Budget Exhausted"));
+
+        assertFalse(CitizenJobManager.isBudgetExhaustedReason(
+                "stage_budget_exhausted: stage 'chop' used its action budget without "
+                        + "meeting its exit condition; resume to grant another pass"));
+        assertFalse(CitizenJobManager.isBudgetExhaustedReason(
+                "provider_unavailable: provider is busy"));
+        assertFalse(CitizenJobManager.isBudgetExhaustedReason("canceled"));
+        assertFalse(CitizenJobManager.isBudgetExhaustedReason(null));
+    }
+
+    @Test
+    void cancelRetriesBackOffThenSettleAtASlowCadence() {
+        assertEquals(CitizenJobManager.brainRetryDelayTicks(0),
+                CitizenJobManager.cancelRetryDelayTicks(0));
+        assertEquals(CitizenJobManager.brainRetryDelayTicks(5),
+                CitizenJobManager.cancelRetryDelayTicks(5));
+        assertEquals(6_000L, CitizenJobManager.cancelRetryDelayTicks(6));
+        assertEquals(6_000L, CitizenJobManager.cancelRetryDelayTicks(40));
+        assertEquals(CitizenJobManager.brainRetryDelayTicks(0),
+                CitizenJobManager.cancelRetryDelayTicks(-1));
+    }
+
+    @Test
+    void oversizedResultsKeepTheirSuccessFlagInsteadOfBecomingFailures() {
+        String small = "{\"success\":true,\"data\":{\"count\":3}}";
+        assertEquals(small, CitizenJobManager.boundedResult(small));
+
+        String hugeSuccess = "{\"success\":true,\"blocks\":\"" + "x".repeat(20_000) + "\"}";
+        JsonObject truncated = JsonParser.parseString(
+                CitizenJobManager.boundedResult(hugeSuccess)).getAsJsonObject();
+        assertTrue(truncated.get("success").getAsBoolean());
+        assertTrue(truncated.get("truncated").getAsBoolean());
+        assertTrue(truncated.get("message").getAsString().contains("smaller radius"));
+
+        String hugeFailure = "{\"success\":false,\"detail\":\"" + "x".repeat(20_000) + "\"}";
+        JsonObject failed = JsonParser.parseString(
+                CitizenJobManager.boundedResult(hugeFailure)).getAsJsonObject();
+        assertFalse(failed.get("success").getAsBoolean());
+        assertTrue(failed.get("truncated").getAsBoolean());
+
+        String hugeGarbage = "y".repeat(20_000);
+        JsonObject garbage = JsonParser.parseString(
+                CitizenJobManager.boundedResult(hugeGarbage)).getAsJsonObject();
+        assertFalse(garbage.get("success").getAsBoolean());
+    }
+
+    @Test
+    void failureMessageTruncationNeverSplitsASurrogatePair() {
+        String longPrefix = "x".repeat(159);
+        String emoji = new String(Character.toChars(0x1F332));
+        String bounded = CitizenJobManager.failureMessage(
+                "{\"success\":false,\"message\":\"" + longPrefix + emoji + "tail\"}");
+        assertEquals(159, bounded.length());
+        assertFalse(Character.isHighSurrogate(bounded.charAt(bounded.length() - 1)));
+
+        // A pair that fits entirely inside the bound is preserved.
+        String shortMessage = "yol yok " + emoji;
+        assertEquals(shortMessage, CitizenJobManager.failureMessage(
+                "{\"success\":false,\"message\":\"yol yok " + emoji + "\"}"));
+    }
+
+    @Test
+    void only409JobInProgressCountsAsStillPlanning() {
+        BrainHttpClient.BrainRequestException stillPlanning =
+                new BrainHttpClient.BrainRequestException(
+                        "brain returned HTTP 409: job operation is still waiting for the model",
+                        409,
+                        "job_in_progress");
+        assertTrue(CitizenJobManager.isStillPlanningError(stillPlanning));
+        // Async completions arrive wrapped; the cause is what gets classified.
+        assertTrue(CitizenJobManager.isStillPlanningError(
+                new java.util.concurrent.CompletionException(stillPlanning)));
+
+        assertFalse(CitizenJobManager.isStillPlanningError(
+                new BrainHttpClient.BrainRequestException(
+                        "brain returned HTTP 409: job is canceled", 409, "job_not_ready")));
+        assertFalse(CitizenJobManager.isStillPlanningError(
+                new BrainHttpClient.BrainRequestException(
+                        "brain returned HTTP 503: capacity", 503, "capacity_reached")));
+        assertFalse(CitizenJobManager.isStillPlanningError(
+                new BrainHttpClient.BrainRequestException("could not construct brain request")));
+        assertFalse(CitizenJobManager.isStillPlanningError(
+                new RuntimeException("connection refused")));
+        assertFalse(CitizenJobManager.isStillPlanningError(null));
+    }
+
+    @Test
     void actionWatchdogGivesSearchAndBuildToolsLongerDeadlines() {
         assertEquals(20L * 240L, CitizenJobManager.actionTimeoutTicks("goto"));
         assertEquals(20L * 240L, CitizenJobManager.actionTimeoutTicks("equip_item"));

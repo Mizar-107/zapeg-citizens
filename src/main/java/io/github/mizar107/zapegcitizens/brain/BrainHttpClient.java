@@ -136,7 +136,9 @@ final class BrainHttpClient {
                     if (response.statusCode() < 200 || response.statusCode() >= 300) {
                         throw new BrainRequestException(
                                 "brain returned HTTP " + response.statusCode() + ": "
-                                        + BrainProtocol.parseError(response.body()));
+                                        + BrainProtocol.parseError(response.body()),
+                                response.statusCode(),
+                                BrainProtocol.parseErrorCode(response.body()));
                     }
                     return response.body();
                 });
@@ -250,13 +252,39 @@ final class BrainHttpClient {
         }
     }
 
+    /**
+     * A failed brain request. Non-2xx responses carry the HTTP status and the
+     * machine-readable body error code (or {@code 0}/{@code ""} for transport
+     * and construction failures), so callers can distinguish a healthy
+     * "still planning" 409 from a real outage without parsing message text.
+     */
     static final class BrainRequestException extends RuntimeException {
+
+        private final int statusCode;
+        private final String errorCode;
+
         BrainRequestException(String message) {
+            this(message, 0, "");
+        }
+
+        BrainRequestException(String message, int statusCode, String errorCode) {
             super(message);
+            this.statusCode = statusCode;
+            this.errorCode = errorCode == null ? "" : errorCode;
         }
 
         BrainRequestException(String message, Throwable cause) {
             super(message, cause);
+            this.statusCode = 0;
+            this.errorCode = "";
+        }
+
+        int statusCode() {
+            return statusCode;
+        }
+
+        String errorCode() {
+            return errorCode;
         }
     }
 }

@@ -63,6 +63,11 @@ public final class PendingToolResults {
         return pending.size();
     }
 
+    /** Server-stopping cleanup: drop every pending callback without invoking it. */
+    public void clear() {
+        pending.clear();
+    }
+
     static boolean isAsyncAcceptance(String resultJson) {
         if (resultJson == null || resultJson.isBlank()) {
             return false;

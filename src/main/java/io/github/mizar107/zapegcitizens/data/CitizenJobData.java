@@ -68,13 +68,17 @@ public final class CitizenJobData extends SavedData {
                 .findFirst();
     }
 
-    /** The one nonterminal job actually driving the citizen, ignoring waiting rows. */
+    /**
+     * The one nonterminal job actually driving the citizen, ignoring waiting
+     * rows and budget-parked rows.
+     */
     public Optional<JobRecord> activeDrivingForCitizen(UUID citizenId) {
         Objects.requireNonNull(citizenId, "citizenId");
         return jobs.values().stream()
                 .filter(job -> job.citizenId().equals(citizenId)
                         && !job.state().terminal()
-                        && !isWaitingInLine(job))
+                        && !isWaitingInLine(job)
+                        && !isParkedByBudget(job))
                 .findFirst();
     }
 
@@ -91,6 +95,16 @@ public final class CitizenJobData extends SavedData {
         return job != null
                 && job.state() == JobState.QUEUED
                 && WAITING_PHASE.equals(job.progress().phase());
+    }
+
+    /**
+     * True for a job permanently parked by an exhausted budget. A parked row
+     * is effectively terminal for scheduling — it no longer drives the citizen
+     * (queued work promotes past it) and cannot resume; only cancellation
+     * clears it — but it stays visible so its owner learns why it stopped.
+     */
+    public static boolean isParkedByBudget(JobRecord job) {
+        return job != null && job.state() == JobState.PAUSED_BUDGET;
     }
 
     public List<JobRecord> all() {

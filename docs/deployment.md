@@ -23,8 +23,9 @@ brain, but keep the Ollama key only on the brain:
 # Minecraft container
 CITIZENS_BRAIN_URL=http://citizen-brain:8787
 CITIZENS_BRAIN_TOKEN_FILE=/run/secrets/citizens_brain_token
-# Budget above sidecar queue timeout + provider socket timeout + overhead.
-CITIZENS_BRAIN_REQUEST_TIMEOUT_MS=150000
+# Budget above the sidecar's worst-case single job pass: planning-loop entry
+# bound (100s) + queue timeout (20s) + provider socket timeout (90s) = 210s.
+CITIZENS_BRAIN_REQUEST_TIMEOUT_MS=300000
 # Bounds a complete model/tool loop, including a lost Numen completion callback.
 CITIZENS_BRAIN_TURN_TIMEOUT_MS=600000
 # Durable-job defaults. Paused time does not consume the active-time budget.
@@ -54,12 +55,15 @@ pack, or reuse the bridge token as the provider key.
 For a host-local Ollama installation, set the URL to its private/container-network
 address. `localhost` inside the brain container refers to the brain container itself.
 
-For ordinary responses, budget the mod request timeout above the sidecar queue
-timeout plus provider socket timeout, with network/database overhead. The defaults
-are 150 seconds in the mod versus 20 + 90 seconds in the sidecar. If those sidecar
-values are increased, raise `CITIZENS_BRAIN_REQUEST_TIMEOUT_MS` as well (the mod's
-accepted maximum is 600,000 ms), or concurrent citizens can time out while waiting
-for the shared provider slot. This is capacity planning, not a hard provider
+Budget the mod request timeout above the sidecar's worst-case single pass. For a
+durable-job request that is `CITIZENS_MAX_JOB_REQUEST_SECONDS` (100, planning-loop
+*entry* bound) plus one final pass of queue wait (20) plus provider socket timeout
+(90) ≈ 210 seconds; dialogue turns are bounded by 20 + 90 alone. The defaults are
+300 seconds in the mod versus that 210-second worst case (the brain's
+`test_config` guards the sum). If any sidecar value is increased, raise
+`CITIZENS_BRAIN_REQUEST_TIMEOUT_MS` as well (the mod's accepted maximum is
+600,000 ms), or concurrent citizens can time out while waiting for the shared
+provider slot. This is capacity planning, not a hard provider
 wall-clock bound: a peer that continuously trickles bytes can outlive a socket
 timeout. The mod request timeout still releases the caller, and the ten-minute
 watchdog clears an ordinary dialogue turn; an already-running provider request may

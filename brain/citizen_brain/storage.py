@@ -1124,6 +1124,9 @@ class SQLiteStore:
                     "action_name": payload.get("action_name"),
                     "success": isinstance(result_content, str)
                     and _successful_tool_result(result_content),
+                    # Raw journaled result content; template quantity gates
+                    # (inventory_delta) read possession evidence out of it.
+                    "result": result_content if isinstance(result_content, str) else None,
                 }
             )
         return actions

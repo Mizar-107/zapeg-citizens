@@ -17,9 +17,12 @@ class ProviderError(RuntimeError):
 class ProviderUnavailable(ProviderError):
     """A transient transport/capacity failure the model cannot fix.
 
-    Raised for queue-slot timeouts, HTTP/socket errors, oversized or undecodable
-    provider bodies. Job planning maps this to a retryable pause instead of
-    burning bounded planner-fault retries on an outage.
+    Raised for queue-slot timeouts, socket errors, retryable HTTP statuses
+    (408/429/5xx), and oversized or undecodable provider bodies. Job planning
+    maps this to a retryable pause instead of burning bounded planner-fault
+    retries on an outage. A stable 4xx (bad key, wrong model) stays a plain
+    :class:`ProviderError` so a configuration typo surfaces loudly instead of
+    masquerading as an endless outage.
     """
 
 
@@ -112,7 +115,17 @@ class OllamaChatProvider:
                 with self._opener.open(request, timeout=self._timeout_seconds) as response:
                     raw = response.read(self._max_response_bytes + 1)
             except HTTPError as exc:
-                raise ProviderUnavailable(f"provider returned HTTP {exc.code}") from exc
+                if exc.code in (408, 429) or exc.code >= 500:
+                    raise ProviderUnavailable(
+                        f"provider returned HTTP {exc.code}"
+                    ) from exc
+                # A stable non-retryable status (401 bad key, 404 wrong model or
+                # URL) is a configuration fault, not an outage: report it loudly
+                # instead of cycling polite provider_unavailable retry pauses.
+                raise ProviderError(
+                    f"provider rejected the request with HTTP {exc.code}; check "
+                    "CITIZENS_LLM_URL, CITIZENS_LLM_MODEL, and CITIZENS_LLM_API_KEY"
+                ) from exc
             except (URLError, TimeoutError, OSError) as exc:
                 raise ProviderUnavailable("provider request failed") from exc
         finally:

@@ -7,6 +7,7 @@ import io.github.mizar107.zapegcitizens.brain.CitizenBrainCoordinator.Interactio
 import io.github.mizar107.zapegcitizens.brain.CitizenJobManager;
 import io.github.mizar107.zapegcitizens.brain.CitizenJobManager.JobOperation;
 import io.github.mizar107.zapegcitizens.chat.CitizenChatAddress;
+import io.github.mizar107.zapegcitizens.chat.TurkishFold;
 import io.github.mizar107.zapegcitizens.command.CitizenCommands;
 import io.github.mizar107.zapegcitizens.compat.NumenServerCompat;
 import io.github.mizar107.zapegcitizens.compat.brain.NumenToolGateway;
@@ -149,6 +150,9 @@ public final class CitizenForgeEvents {
     @SubscribeEvent
     public static void onServerStopping(ServerStoppingEvent event) {
         LAST_TASK_TICK.clear();
+        // A task dropped by the dying server.execute queue would otherwise
+        // leak its pending-result entry until the next cancelBody.
+        NumenToolGateway.clearPending();
         CitizenBrainCoordinator.instance().shutdown(event.getServer());
         for (LifecycleResult result
                 : ServerCitizenLifecycleManager.instance().shutdown(event.getServer())) {
@@ -201,7 +205,14 @@ public final class CitizenForgeEvents {
                             "[Citizens] " + record.name() + ": " + jobs.formatStatus(activeJob)));
                     return;
                 }
-                if (isStop(address.prompt())) {
+                if (isStopEverything(address.prompt())) {
+                    JobOperation operation = jobs.stopAll(
+                            actor.server, record, "stopped by its assigned player");
+                    actor.sendSystemMessage(Component.literal(
+                            "[Citizens] " + operation.message()));
+                    return;
+                }
+                if (isCancelActive(address.prompt())) {
                     JobOperation operation = jobs.cancel(
                             actor.server, record, "canceled by its assigned player");
                     actor.sendSystemMessage(Component.literal(
@@ -229,7 +240,14 @@ public final class CitizenForgeEvents {
                         : "[Citizens] " + record.name() + ": " + jobs.formatStatus(activeJob)));
                 return;
             }
-            if (isStop(address.prompt())) {
+            if (isStopEverything(address.prompt())) {
+                JobOperation operation = jobs.stopAll(
+                        actor.server, record, "stopped by its assigned player");
+                actor.sendSystemMessage(Component.literal(
+                        "[Citizens] " + operation.message()));
+                return;
+            }
+            if (isCancelActive(address.prompt())) {
                 JobOperation operation = jobs.cancel(
                         actor.server, record, "canceled by its assigned player");
                 actor.sendSystemMessage(Component.literal(
@@ -282,31 +300,39 @@ public final class CitizenForgeEvents {
         }
     }
 
-    private static boolean isStop(String prompt) {
-        String normalized = prompt.strip().toLowerCase(java.util.Locale.ROOT);
-        return normalized.equals("stop")
-                || normalized.equals("cancel")
-                || normalized.equals("dur")
-                || normalized.equals("iptal");
+    /**
+     * "stop"/"dur" means stand down completely: cancel the current job AND the
+     * whole waiting queue. "cancel"/"iptal" cancels only the current job (the
+     * next queued one then promotes and announces itself). Both are folded via
+     * {@link TurkishFold} so "DUR" and "İptal" match too.
+     */
+    static boolean isStopEverything(String prompt) {
+        String normalized = TurkishFold.fold(prompt).strip();
+        return normalized.equals("stop") || normalized.equals("dur");
     }
 
-    private static boolean isStatus(String prompt) {
-        String normalized = prompt.strip().toLowerCase(java.util.Locale.ROOT);
+    static boolean isCancelActive(String prompt) {
+        String normalized = TurkishFold.fold(prompt).strip();
+        return normalized.equals("cancel") || normalized.equals("iptal");
+    }
+
+    static boolean isStatus(String prompt) {
+        String normalized = TurkishFold.fold(prompt).strip();
         return normalized.equals("status")
                 || normalized.equals("progress")
                 || normalized.equals("durum");
     }
 
-    private static boolean isResume(String prompt) {
-        String normalized = prompt.strip().toLowerCase(java.util.Locale.ROOT);
+    static boolean isResume(String prompt) {
+        String normalized = TurkishFold.fold(prompt).strip();
         return normalized.equals("resume")
                 || normalized.equals("continue")
                 || normalized.equals("devam");
     }
 
-    private static String answerText(String prompt) {
+    static String answerText(String prompt) {
         String stripped = prompt.strip();
-        String normalized = stripped.toLowerCase(java.util.Locale.ROOT);
+        String normalized = TurkishFold.fold(stripped);
         if (normalized.startsWith("answer ")) {
             return stripped.substring("answer ".length()).strip();
         }

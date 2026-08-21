@@ -69,6 +69,17 @@ final class WorkerToolPolicyTest {
     }
 
     @Test
+    void classifiesExactlyTheTwoAttackToolsForThePlayerTargetGuard() {
+        assertTrue(WorkerToolPolicy.isAttackTool("melee_attack"));
+        assertTrue(WorkerToolPolicy.isAttackTool("ranged_attack"));
+
+        assertFalse(WorkerToolPolicy.isAttackTool("mine"));
+        assertFalse(WorkerToolPolicy.isAttackTool("interact_entity"));
+        assertFalse(WorkerToolPolicy.isAttackTool("task_stop"));
+        assertFalse(WorkerToolPolicy.isAttackTool(null));
+    }
+
+    @Test
     void excludesOnlyClientOnlyAndUnknownTools() {
         // Numen implements these two as client-side planning/skill helpers; the
         // dedicated-server bridge has no client context in which to run them.

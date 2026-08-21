@@ -104,11 +104,20 @@ class TemplateDetectionTest(unittest.TestCase):
 
 class StageMachineTest(unittest.TestCase):
     @staticmethod
-    def _confirmed(*entries: tuple[int, str, bool]) -> list[dict]:
-        return [
-            {"event_id": event_id, "action_id": f"a{event_id}", "action_name": name, "success": success}
-            for event_id, name, success in entries
-        ]
+    def _confirmed(*entries: tuple) -> list[dict]:
+        rows = []
+        for entry in entries:
+            event_id, name, success = entry[0], entry[1], entry[2]
+            row = {
+                "event_id": event_id,
+                "action_id": f"a{event_id}",
+                "action_name": name,
+                "success": success,
+            }
+            if len(entry) > 3:
+                row["result"] = json.dumps(entry[3])
+            rows.append(row)
+        return rows
 
     def test_stages_advance_only_on_ordered_successful_evidence(self) -> None:
         template = detect_template("gather 4 logs")
@@ -119,30 +128,110 @@ class StageMachineTest(unittest.TestCase):
         self.assertFalse(advanced)
         self.assertEqual("survey", current_stage(updated)["name"])
 
-        # One successful mine proves the logs were found AND chops them: the
-        # same event satisfies survey and chop, landing on verify_deliver.
+        # One successful mine proves the logs were found (survey), but the chop
+        # stage is quantity-gated: without inventory evidence it cannot advance.
         updated, advanced = advance_stages(
             template, self._confirmed((1, "scan_blocks", False), (2, "mine", True)), 2
         )
         self.assertTrue(advanced)
-        self.assertEqual("verify_deliver", current_stage(updated)["name"])
+        self.assertEqual("chop", current_stage(updated)["name"])
         self.assertFalse(is_final_complete(updated))
 
-        # Evidence recorded before the stage began can never satisfy it: the
-        # get_self_status from event 1 does not complete verify_deliver.
-        early_status = self._confirmed(
-            (1, "get_self_status", True), (2, "mine", True)
-        )
-        updated, _ = advance_stages(template, early_status, 2)
-        self.assertEqual("verify_deliver", current_stage(updated)["name"])
-        self.assertFalse(is_final_complete(updated))
-
-        # A verification after the mine completes the final stage.
+        # Confirmed inventory evidence of 4 newly gained logs (5 now against a
+        # baseline of 1 from before the stage) satisfies chop, and the same
+        # verification event satisfies verify_deliver: the template completes.
         full = self._confirmed(
-            (1, "scan_blocks", True), (2, "mine", True), (3, "get_self_status", True)
+            (1, "get_self_status", True,
+             {"success": True, "inventory": {"minecraft:oak_log": 1}}),
+            (2, "scan_blocks", True),
+            (3, "mine", True),
+            (4, "get_self_status", True,
+             {"success": True, "inventory": {"minecraft:oak_log": 5}}),
         )
-        updated, advanced = advance_stages(template, full, 3)
+        updated, advanced = advance_stages(template, full, 4)
         self.assertTrue(advanced)
+        self.assertTrue(is_final_complete(updated))
+
+        # Pre-owned stock never satisfies the quantity gate: identical counts
+        # before and after the stage began prove nothing new was gained.
+        stale = self._confirmed(
+            (1, "get_self_status", True,
+             {"success": True, "inventory": {"minecraft:oak_log": 4}}),
+            (2, "scan_blocks", True),
+            (3, "get_self_status", True,
+             {"success": True, "inventory": {"minecraft:oak_log": 4}}),
+        )
+        updated, _ = advance_stages(template, stale, 3)
+        self.assertEqual("chop", current_stage(updated)["name"])
+        self.assertFalse(is_final_complete(updated))
+
+    def test_quantity_honesty_blocks_count_blind_completion(self) -> None:
+        # CIT-04 regression: "64 odun topla" used to complete after ONE
+        # successful mine of any size plus one get_self_status.
+        template = detect_template("template:gather_wood n=64")
+        short = self._confirmed(
+            (1, "mine", True),
+            (2, "get_self_status", True,
+             {"success": True, "inventory": {"minecraft:oak_log": 6}}),
+        )
+        updated, _ = advance_stages(template, short, 2)
+        self.assertEqual("chop", current_stage(updated)["name"])
+        self.assertFalse(is_final_complete(updated))
+
+        # Log variants count toward the same '*_log' family; 64 gained completes.
+        full = self._confirmed(
+            (1, "mine", True),
+            (2, "get_self_status", True,
+             {"success": True, "inventory": {
+                 "minecraft:oak_log": 40, "minecraft:birch_log": 24}}),
+        )
+        updated, _ = advance_stages(template, full, 2)
+        self.assertTrue(is_final_complete(updated))
+
+    def test_mine_ore_quantity_gate_counts_drops_and_ore_variants(self) -> None:
+        template = detect_template("template:mine_ore type=iron n=8")
+        evidence = self._confirmed(
+            (1, "get_self_status", True,
+             {"success": True, "inventory": {"minecraft:raw_iron": 3}}),
+            (2, "mine", True),
+            (3, "get_self_status", True,
+             {"success": True, "inventory": {
+                 "minecraft:raw_iron": 9, "minecraft:deepslate_iron_ore": 2}}),
+        )
+        updated, _ = advance_stages(template, evidence, 3)
+        self.assertTrue(is_final_complete(updated))
+
+        # 3 pre-owned raw iron plus 6 gained is short of 8: the gate holds.
+        short = self._confirmed(
+            (1, "get_self_status", True,
+             {"success": True, "inventory": {"minecraft:raw_iron": 3}}),
+            (2, "mine", True),
+            (3, "get_self_status", True,
+             {"success": True, "inventory": {"minecraft:raw_iron": 9}}),
+        )
+        updated, _ = advance_stages(template, short, 3)
+        self.assertEqual("mine", current_stage(updated)["name"])
+
+    def test_delta_evidence_reads_record_form_and_ignores_scans(self) -> None:
+        template = detect_template("chop 2 logs")
+        # A scan listing 30 visible logs is world evidence, not possession.
+        scans = self._confirmed(
+            (1, "mine", True),
+            (2, "scan_blocks", True,
+             {"success": True, "blocks": {"minecraft:oak_log": 30}}),
+        )
+        updated, _ = advance_stages(template, scans, 2)
+        self.assertEqual("chop", current_stage(updated)["name"])
+
+        # Record-form collection payloads count as possession evidence.
+        records = self._confirmed(
+            (1, "mine", True),
+            (2, "collect_items", True,
+             {"success": True, "collected": [
+                 {"item": "minecraft:oak_log", "count": 2}]}),
+            (3, "get_self_status", True),
+        )
+        updated, _ = advance_stages(template, records, 3)
         self.assertTrue(is_final_complete(updated))
 
     def test_stage_budget_exhaustion_and_rearm(self) -> None:
@@ -158,7 +247,9 @@ class StageMachineTest(unittest.TestCase):
         done, _ = advance_stages(
             template,
             self._confirmed(
-                (1, "mine", True), (2, "get_self_status", True)
+                (1, "mine", True),
+                (2, "get_self_status", True,
+                 {"success": True, "inventory": {"minecraft:oak_log": 4}}),
             ),
             2,
         )
@@ -254,7 +345,9 @@ class TemplateJobFlowTest(TempDatabaseTest, unittest.TestCase):
             result_payload("r2", "job-1", survey_done["action"]["id"], {"success": True, "count": 6})
         )
         self.assertEqual("get_self_status", chop_done["action"]["name"])
-        self.assertIn('"stage":"verify_deliver"', provider.calls[-1][0][1]["content"])
+        # A bare mine success carries no possession evidence: the quantity-gated
+        # chop stage holds until inventory proof of the six new logs arrives.
+        self.assertIn('"stage":"chop"', provider.calls[-1][0][1]["content"])
 
         provider.replies.append(
             reply(
@@ -302,12 +395,12 @@ class TemplateJobFlowTest(TempDatabaseTest, unittest.TestCase):
             result_payload("r1", "job-1", mine_id, {"success": True, "count": 2})
         )
         # The premature finish became a planner fault; the planner was re-asked
-        # and moved to the verification the final stage requires.
+        # and moved to the verification the quantity-gated chop stage requires.
         self.assertEqual("ACTION", response["kind"])
         self.assertEqual("get_self_status", response["action"]["name"])
         follow_up = json.dumps(provider.calls[-1][0], ensure_ascii=False)
         self.assertIn("job_finish is rejected", follow_up)
-        self.assertIn("verify_deliver", follow_up)
+        self.assertIn("'chop'", follow_up)
 
     def test_stage_budget_pause_and_resume_rearm(self) -> None:
         provider = FakeProvider(reply("scan_blocks", {}))

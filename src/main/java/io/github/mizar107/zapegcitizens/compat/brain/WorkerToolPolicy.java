@@ -50,6 +50,13 @@ public final class WorkerToolPolicy {
 
     private static final Set<String> NAMES = Set.copyOf(ORDERED_NAMES);
 
+    /**
+     * Combat tools whose target argument is checked against connected real
+     * players before execution: PvP-by-proxy through a citizen stays off no
+     * matter what the planner or an owner asks for.
+     */
+    private static final Set<String> ATTACK_TOOLS = Set.of("melee_attack", "ranged_attack");
+
     private WorkerToolPolicy() {}
 
     public static List<String> orderedNames() {
@@ -58,5 +65,9 @@ public final class WorkerToolPolicy {
 
     public static boolean isAllowed(String toolName) {
         return toolName != null && NAMES.contains(toolName);
+    }
+
+    public static boolean isAttackTool(String toolName) {
+        return toolName != null && ATTACK_TOOLS.contains(toolName);
     }
 }

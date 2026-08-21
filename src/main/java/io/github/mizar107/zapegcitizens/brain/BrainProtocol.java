@@ -270,6 +270,33 @@ final class BrainProtocol {
         return "brain request was rejected";
     }
 
+    /**
+     * Machine-readable error code from a non-2xx brain body
+     * ({@code {"error":{"code":"job_in_progress",...}}}), or {@code ""} when
+     * absent or unparseable. Callers branch on exact codes (e.g. the healthy
+     * still-planning 409) without depending on human-readable message text.
+     */
+    static String parseErrorCode(String body) {
+        if (body == null || body.isBlank()) {
+            return "";
+        }
+        try {
+            JsonObject root = JsonParser.parseString(body).getAsJsonObject();
+            if (root.has("error") && root.get("error").isJsonObject()) {
+                JsonObject errorObject = root.getAsJsonObject("error");
+                if (errorObject.has("code") && errorObject.get("code").isJsonPrimitive()) {
+                    String code = errorObject.get("code").getAsString().strip();
+                    if (PROTOCOL_IDENTIFIER.matcher(code).matches()) {
+                        return code;
+                    }
+                }
+            }
+        } catch (RuntimeException ignored) {
+            // Unparseable bodies simply have no machine-readable code.
+        }
+        return "";
+    }
+
     private static JsonObject base() {
         JsonObject root = new JsonObject();
         root.addProperty("protocol", VERSION);

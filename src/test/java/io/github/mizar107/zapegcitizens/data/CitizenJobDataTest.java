@@ -171,6 +171,74 @@ class CitizenJobDataTest {
     }
 
     @Test
+    void queueMatrixKeepsOrderAndOneDrivingRowAcrossTerminalTransitions() {
+        CitizenJobData data = new CitizenJobData();
+        UUID citizenId = UUID.randomUUID();
+        JobRecord driving = job(UUID.randomUUID(), citizenId, JobState.RUNNING);
+        data.create(driving);
+        JobRecord firstWaiting = waitingRow(citizenId, 120);
+        JobRecord secondWaiting = waitingRow(citizenId, 140);
+        data.create(firstWaiting);
+        data.create(secondWaiting);
+
+        // Oldest-first order and resolution while the driving job is live.
+        assertEquals(2, data.waitingForCitizen(citizenId).size());
+        assertEquals(firstWaiting.jobId(), data.waitingForCitizen(citizenId).get(0).jobId());
+        assertEquals(secondWaiting.jobId(), data.waitingForCitizen(citizenId).get(1).jobId());
+        assertEquals(driving.jobId(), data.activeForCitizen(citizenId).orElseThrow().jobId());
+        assertEquals(
+                driving.jobId(), data.activeDrivingForCitizen(citizenId).orElseThrow().jobId());
+
+        // A third waiting row is storable while a second driving row throws.
+        data.create(waitingRow(citizenId, 160));
+        assertThrows(IllegalStateException.class,
+                () -> data.create(job(UUID.randomUUID(), citizenId, JobState.QUEUED)));
+
+        // Terminal the driving job: order among the waiting rows is preserved
+        // and the citizen has no driving row until one is promoted.
+        data.update(driving.jobId(), current -> current.transition(
+                JobState.FAILED,
+                current.progress(),
+                current.actionsCompleted(),
+                current.activeTicks(),
+                Optional.empty(),
+                current.lastConfirmedActionId(),
+                Optional.of("failed"),
+                500));
+        assertTrue(data.activeDrivingForCitizen(citizenId).isEmpty());
+        assertEquals(3, data.waitingForCitizen(citizenId).size());
+        assertEquals(firstWaiting.jobId(), data.waitingForCitizen(citizenId).get(0).jobId());
+    }
+
+    @Test
+    void budgetParkedJobsNoLongerCountAsDrivingButStayAddressable() {
+        CitizenJobData data = new CitizenJobData();
+        UUID citizenId = UUID.randomUUID();
+        JobRecord parked = job(UUID.randomUUID(), citizenId, JobState.PAUSED_BUDGET);
+        data.create(parked);
+        assertTrue(CitizenJobData.isParkedByBudget(parked));
+
+        // Parked rows are terminal for scheduling: no driving row, so queued
+        // work can promote past them; they stay visible via activeForCitizen.
+        assertTrue(data.activeDrivingForCitizen(citizenId).isEmpty());
+        assertEquals(parked.jobId(), data.activeForCitizen(citizenId).orElseThrow().jobId());
+
+        // The next job may start (and reload keeps both rows) while parked.
+        JobRecord next = job(UUID.randomUUID(), citizenId, JobState.QUEUED);
+        data.create(next);
+        assertEquals(next.jobId(), data.activeDrivingForCitizen(citizenId).orElseThrow().jobId());
+        CitizenJobData reloaded = CitizenJobData.load(data.save(new CompoundTag()));
+        assertEquals(2, reloaded.forCitizen(citizenId).size());
+        assertEquals(
+                next.jobId(), reloaded.activeDrivingForCitizen(citizenId).orElseThrow().jobId());
+
+        assertTrue(CitizenJobData.isParkedByBudget(
+                reloaded.find(parked.jobId()).orElseThrow()));
+        assertEquals(false, CitizenJobData.isParkedByBudget(next));
+        assertEquals(false, CitizenJobData.isParkedByBudget(null));
+    }
+
+    @Test
     void transitionCannotReplaceJobOrCitizenIdentity() {
         CitizenJobData data = new CitizenJobData();
         JobRecord active = job(UUID.randomUUID(), UUID.randomUUID(), JobState.RUNNING);
@@ -200,6 +268,21 @@ class CitizenJobDataTest {
         assertEquals(
                 CitizenJobData.MAX_TERMINAL_JOBS_PER_CITIZEN,
                 data.forCitizen(citizenId).size());
+    }
+
+    private static JobRecord waitingRow(UUID citizenId, long createdAt) {
+        return job(UUID.randomUUID(), citizenId, JobState.QUEUED)
+                .transition(
+                        JobState.QUEUED,
+                        new JobProgress(
+                                CitizenJobData.WAITING_PHASE,
+                                "Waiting for the citizen's current job to finish."),
+                        0,
+                        0,
+                        Optional.empty(),
+                        Optional.empty(),
+                        Optional.empty(),
+                        createdAt);
     }
 
     private static JobRecord job(UUID jobId, UUID citizenId, JobState state) {

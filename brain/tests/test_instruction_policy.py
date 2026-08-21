@@ -62,6 +62,87 @@ class InstructionPolicyTest(unittest.TestCase):
             )
         )
 
+    def test_turkish_storage_and_craft_goals_are_protected(self) -> None:
+        # "sandığa koy" (put it in the chest) demands a storage move.
+        self.assertEqual(
+            PREMATURE_FINISH_FAULT,
+            premature_finish_fault(
+                "8 odun topla ve sandığa koy",
+                [{"action_name": "mine", "success": True}],
+            ),
+        )
+        self.assertIsNone(
+            premature_finish_fault(
+                "8 odun topla ve sandığa koy",
+                [
+                    {"action_name": "mine", "success": True},
+                    {"action_name": "transfer", "success": True},
+                ],
+            )
+        )
+        # Case-insensitive including Turkish dotted/dotless i, plus "depola".
+        self.assertEqual(
+            PREMATURE_FINISH_FAULT,
+            premature_finish_fault(
+                "TAŞLARI SANDIĞA AT", [{"action_name": "mine", "success": True}]
+            ),
+        )
+        self.assertEqual(
+            PREMATURE_FINISH_FAULT,
+            premature_finish_fault(
+                "kömürü depola", [{"action_name": "mine", "success": True}]
+            ),
+        )
+        # "üret"/"craftla" demand a craft action.
+        self.assertEqual(
+            PREMATURE_FINISH_FAULT,
+            premature_finish_fault(
+                "odun topla ve çubuk üret", [{"action_name": "mine", "success": True}]
+            ),
+        )
+        self.assertIsNone(
+            premature_finish_fault(
+                "odun topla ve çubuk üret",
+                [
+                    {"action_name": "mine", "success": True},
+                    {"action_name": "craft", "success": True},
+                ],
+            )
+        )
+
+    def test_turkish_reissue_requests_are_rejected(self) -> None:
+        self.assertEqual(
+            SEQUENCE_REISSUE_FAULT,
+            sequence_reissue_fault(
+                "8 odun topla ve sandığa koy",
+                "Odunları topladım. Devam etmemi ister misin?",
+            ),
+        )
+        self.assertEqual(
+            SEQUENCE_REISSUE_FAULT,
+            sequence_reissue_fault(
+                "8 odun topla ve sandığa koy",
+                "Sandığa koyayım mı?",
+            ),
+        )
+        self.assertEqual(
+            SEQUENCE_REISSUE_FAULT,
+            sequence_reissue_fault(
+                "kule inşa et", "Devam de, seni bekliyorum."
+            ),
+        )
+        # A real Turkish blocker/question is not a re-issue request.
+        self.assertIsNone(
+            sequence_reissue_fault(
+                "bir barınak yap", "Hangi ağaç türünü kullanayım, meşe mi huş mu?"
+            )
+        )
+        self.assertIsNone(
+            sequence_reissue_fault(
+                "5 elmas kaz", "Demir kazma lazım, elmas kazamam."
+            )
+        )
+
     def test_asking_the_player_to_continue_is_rejected(self) -> None:
         self.assertEqual(
             SEQUENCE_REISSUE_FAULT,

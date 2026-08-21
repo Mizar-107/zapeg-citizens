@@ -110,6 +110,26 @@ class BrainProtocolTest {
     }
 
     @Test
+    void extractsMachineReadableErrorCodesForStillPlanningClassification() {
+        assertEquals("job_in_progress", BrainProtocol.parseErrorCode(
+                "{\"protocol\":3,\"error\":{\"code\":\"job_in_progress\","
+                        + "\"message\":\"job operation is still waiting for the model\"}}"));
+        assertEquals("job_not_ready", BrainProtocol.parseErrorCode(
+                "{\"protocol\":3,\"error\":{\"code\":\"job_not_ready\","
+                        + "\"message\":\"job is canceled\"}}"));
+
+        // Missing, malformed, or unsafe codes yield the empty sentinel.
+        assertEquals("", BrainProtocol.parseErrorCode(
+                "{\"protocol\":3,\"error\":{\"message\":\"no code here\"}}"));
+        assertEquals("", BrainProtocol.parseErrorCode(
+                "{\"protocol\":3,\"error\":\"plain text\"}"));
+        assertEquals("", BrainProtocol.parseErrorCode("not-json"));
+        assertEquals("", BrainProtocol.parseErrorCode(null));
+        assertEquals("", BrainProtocol.parseErrorCode(
+                "{\"error\":{\"code\":\"has spaces and \\n control\"}}"));
+    }
+
+    @Test
     void rejectsCoercedTypesAndControlCharacters() {
         assertThrows(BrainProtocol.BrainProtocolException.class,
                 () -> BrainProtocol.parseReply(

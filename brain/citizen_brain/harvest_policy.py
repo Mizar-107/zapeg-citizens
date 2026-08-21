@@ -2,11 +2,19 @@
 
 Vanilla players punch logs, dirt, sand, and similar blocks by hand. An axe is a
 speed upgrade, not a capability gate. Stone and ore still need a pickaxe.
+
+The keyword nets are bilingual: the live server speaks Turkish, so every
+English family carries its Turkish synonyms ("balta" for axe, "kürek" for
+shovel, "makas" for shears, "odun/kütük" for wood/logs). Matching runs over
+:func:`citizen_brain.textfold.fold` output, so ``İ``/``I``/``ı`` all compare as
+a plain ``i`` and the patterns are written in that folded form.
 """
 
 from __future__ import annotations
 
 import re
+
+from .textfold import fold
 
 HAND_HARVEST_FAULT = (
     "wood and other hand-breakable blocks do not require a harvest tool; "
@@ -18,21 +26,28 @@ HAND_HARVEST_FAULT = (
 _WOOD_GOAL = re.compile(
     r"\b(wood|logs?|trees?|chop|lumber|timber|"
     r"oak|spruce|birch|jungle|acacia|dark.?oak|mangrove|cherry|"
-    r"crimson|warped|hyphae|stems?)\b",
+    r"crimson|warped|hyphae|stems?|"
+    r"odun\w*|kütü(?:k|ğ)\w*|kutuk\w*|ağa(?:c|ç)\w*|agac\w*|kereste\w*|tahta\w*)\b",
     re.IGNORECASE,
 )
-_OPTIONAL_TOOL = re.compile(r"\b(axes?|hatchets?|shovels?|shears?)\b", re.IGNORECASE)
-_PICKAXE_ONLY = re.compile(r"\bpickaxes?\b", re.IGNORECASE)
+_OPTIONAL_TOOL = re.compile(
+    r"\b(axes?|hatchets?|shovels?|shears?|"
+    r"balta\w*|kürek\w*|kurek\w*|makas\w*|nacak\w*)\b",
+    re.IGNORECASE,
+)
+_PICKAXE_ONLY = re.compile(r"\b(pickaxes?|kazma\w*)\b", re.IGNORECASE)
 _PUNCHABLE_QUESTION = re.compile(
-    r"\b(wood|logs?|trees?|leaves?|dirt|sand|gravel|punch)\b",
+    r"\b(wood|logs?|trees?|leaves?|dirt|sand|gravel|punch|"
+    r"odun\w*|kütü(?:k|ğ)\w*|kutuk\w*|ağa(?:c|ç)\w*|agac\w*|yaprak\w*|"
+    r"toprak\w*|kum\w*|çakil\w*|cakil\w*|yumruk\w*)\b",
     re.IGNORECASE,
 )
 
 
 def optional_harvest_tool_fault(goal: str | None, question: str | None) -> str | None:
     """Return planner-fault text when job_needs_input asks for a punch-optional tool."""
-    goal_text = goal or ""
-    question_text = question or ""
+    goal_text = fold(goal)
+    question_text = fold(question)
     if not _OPTIONAL_TOOL.search(question_text):
         return None
     if _PICKAXE_ONLY.search(question_text) and not _OPTIONAL_TOOL.search(

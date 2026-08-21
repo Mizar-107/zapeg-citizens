@@ -420,7 +420,9 @@ public final class CitizenCommands {
             return 0;
         }
 
-        JobOperation operation = CitizenJobManager.instance().cancel(
+        // Operator stop matches player "@Name stop": the active job AND the
+        // waiting queue are cleared, so the citizen genuinely stands down.
+        JobOperation operation = CitizenJobManager.instance().stopAll(
                 source.getServer(), record, "canceled by an operator");
         boolean dialogueStopped = CitizenBrainCoordinator.instance()
                 .stopForRemoval(source.getServer(), record);

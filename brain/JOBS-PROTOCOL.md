@@ -8,6 +8,14 @@ All routes below are `POST`, require `Authorization: Bearer <CITIZENS_BRAIN_TOKE
 {"protocol":3,"error":{"code":"invalid_request","message":"safe bounded message"}}
 ```
 
+`error.code` is a machine contract, not display text. In particular, every "the job is
+still waiting on a model call" collision — a retried `/start`, a `/result`, or a `/resume`
+arriving while the job is `CALLING` — returns **409 `job_in_progress`**. Forge classifies
+that code as "healthy, still planning": it re-enters its silent retry wait without burning
+a bounded retry attempt and without announcing an outage. The cancel-before-start
+tombstone fence stays distinct (409 `job_not_ready`, message "job is canceled"), so a
+fenced job fails fast instead of retrying.
+
 ## Start
 
 `POST /v1/job/start`
@@ -130,6 +138,8 @@ that later start.
 
 Pause retains a pending action so a later resume can reconcile it. Cancel is terminal and records any pending action as interrupted. Both operations are idempotent. Canceling or pausing an already completed job preserves its completed response.
 
+Forge-side queue note: a player "stop" cancels the driving job through this handshake AND terminally cancels the citizen's mod-side waiting-in-line jobs. Waiting rows were never started against the brain (their `/start` happens only at promotion), so they are canceled purely in the world ledger — no `/v1/job/cancel` and no tombstone is issued for them, and their job ids never reach this API.
+
 ## Status and list
 
 `POST /v1/job/status`:
@@ -236,19 +246,25 @@ A provider pass produces either exactly one private planner call or an ordered b
 
 A world action whose exact `(name, arguments)` signature already failed twice consecutively (with no later identical success) is rejected as a planner fault telling the model to change the target, arguments, or approach, or to state the real blocker; bounded retries then pause the job with that reason instead of burning the action budget on a doomed loop.
 
-## Retryable pause reasons
+## Machine-mapped pause reasons
 
-Three machine-readable `reason` prefixes carry contract semantics for Forge:
+Machine-readable `reason` shapes carry contract semantics for Forge:
 
-- `provider_unavailable: ...` — a transport/capacity outage (busy queue slot, HTTP error, undecodable body). It consumes no planner-fault retry; Forge maps it to its bounded `PAUSED_BRAIN` backoff and resumes automatically.
+- `provider_unavailable: ...` — a genuinely retryable transport/capacity outage (busy queue slot, socket failure, HTTP 408/429/5xx, undecodable body). It consumes no planner-fault retry; Forge maps it to its bounded `PAUSED_BRAIN` backoff and resumes automatically. A stable provider 4xx (bad key, wrong model or URL) is deliberately **not** classified this way: it surfaces as a loud configuration fault ("provider rejected the request with HTTP NNN; check CITIZENS_LLM_URL, CITIZENS_LLM_MODEL, and CITIZENS_LLM_API_KEY") through the ordinary planner-fault path instead of cycling polite outage pauses.
 - `planning_in_progress: ...` — the internal planning loop hit the `CITIZENS_MAX_JOB_REQUEST_SECONDS` wall clock and yielded so the HTTP request stays inside the mod's request timeout. Forge resumes automatically; planning continues from the durable checkpoint. Not announced to players.
 - `stage_budget_exhausted: ...` — a deterministic staged-template stall (see below). Forge announces it with resume advice; an explicit `/resume` re-arms the stage's action window.
+- `... budget exhausted` (the job-level `action budget exhausted`, `model-call budget exhausted`, `active-time budget exhausted` reasons, never the `stage_budget_exhausted` prefix above) — a terminal budget stop. Forge parks the job as `PAUSED_BUDGET`: it is not resumable (resuming brain-side deterministically re-pauses with the same reason and burns no model call), queued work promotes past it, and only cancellation clears it.
 
 ## Staged job templates
 
 `detect_template` deterministically matches a small set of goals at `/v1/job/start` — explicit `template:<name> key=value` syntax always wins, plus conservative English/Turkish phrasings for `gather_wood(count)`, `mine_ore(type, count)`, and `simple_build(blueprint)` with the predefined blueprints `shelter_hut`, `storage_hut`, and `watchtower`. Anything else stays a freeform job with unchanged behavior.
 
-A matched template persists with the job (`jobs.template_json`, schema `user_version` 6, migrates in place) as an ordered list of checkpointed stages, each carrying its own goal text, action budget, and exit condition. Stage transitions are server code, never the model: a stage advances only when its exit condition is met by confirmed successful action evidence recorded at or after the previous stage's satisfaction point, so a legitimate jump-ahead (one successful `mine` proving survey and chop at once) is honored while stale earlier evidence never is. Advancing journals a model-visible `stage_advanced` event and discards any queued action batch planned for the previous stage. The model sees the current stage in a `template_stage` block and is told to pursue only that stage's goal; `job_finish` stays rejected until the final stage's evidence exists. Stage state survives restarts with the job row and resumes mid-stage.
+A matched template persists with the job (`jobs.template_json`, schema `user_version` 6, migrates in place) as an ordered list of checkpointed stages, each carrying its own goal text, action budget, and exit condition. Stage transitions are server code, never the model: a stage advances only when its exit condition is met by confirmed successful action evidence recorded at or after the previous stage's satisfaction point, so a legitimate jump-ahead (one successful `mine` proving the survey stage) is honored while stale earlier evidence never is. Advancing journals a model-visible `stage_advanced` event and discards any queued action batch planned for the previous stage. The model sees the current stage in a `template_stage` block and is told to pursue only that stage's goal; `job_finish` stays rejected until the final stage's evidence exists. Stage state survives restarts with the job row and resumes mid-stage.
+
+Two `advance.kind` conditions exist (template version 2; persisted version-1 templates keep evaluating unchanged):
+
+- `successful_action` — the stage exits on N confirmed successful results whose action name is in the stage's set (`strict` demands evidence strictly after the previous stage's satisfaction point; consecutive `build` stages use it).
+- `inventory_delta` — a quantity gate for the gather/mine act stages. The server takes the citizen's item counts at stage start as a baseline (the latest possession evidence journaled at or before the stage began) and exits only when later confirmed evidence shows `(current − baseline) ≥ count` summed over the stage's item family (`items` entries are exact ids like `minecraft:raw_iron` or family suffixes like `_log`; per item id only gains count). Possession evidence is read from successful `get_self_status`/`mine`/`collect_items`/`take_items`/`fish` results, and only from inventory-context subtrees (`inventory`, `collected`, `items`, ...) in both mapping form (`{"minecraft:oak_log": 6}`) and record form (`{"item": "...", "count": n}`) — a `scan_blocks` listing of visible world blocks never counts. Limitations, by design: payloads carry no NBT (enchanted/named variants count as their plain id), and with no pre-stage snapshot the baseline is empty, so pre-owned stock counts once first observed — the survey/preflight stage goals instruct an initial `get_self_status` to establish the baseline, and the act-stage goals instruct a `get_self_status` after mining because only journaled evidence can advance the stage.
 
 ## Persistence and limits
 

@@ -5,6 +5,7 @@ from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 import threading
 import time
 import unittest
+from urllib.error import HTTPError
 
 from citizen_brain.provider import OllamaChatProvider, ProviderError, ProviderUnavailable
 
@@ -190,6 +191,41 @@ class OllamaChatProviderTest(unittest.TestCase):
         )
         with self.assertRaises(ProviderUnavailable):
             garbage.chat([{"role": "user", "content": "x"}], [])
+
+    def test_http_status_classification_separates_outage_from_config_fault(self) -> None:
+        # CIT-08/CIT-14: only genuinely retryable transport statuses are an
+        # "outage"; a stable 4xx (bad key, wrong model) is a loud config fault.
+        class StatusOpener:
+            def __init__(self, code: int) -> None:
+                self.code = code
+
+            def open(self, request, timeout: int):  # noqa: ANN001, ANN201
+                raise HTTPError(request.full_url, self.code, "status", None, None)
+
+        def provider_for(code: int) -> OllamaChatProvider:
+            return OllamaChatProvider(
+                url="http://ollama/api/chat",
+                model="model",
+                api_key=None,
+                timeout_seconds=5,
+                max_response_bytes=4096,
+                opener=StatusOpener(code),
+            )
+
+        for retryable in (500, 502, 503, 429, 408):
+            with self.assertRaises(ProviderUnavailable, msg=str(retryable)):
+                provider_for(retryable).chat([{"role": "user", "content": "x"}], [])
+
+        for config_fault in (401, 403, 404, 400):
+            try:
+                provider_for(config_fault).chat([{"role": "user", "content": "x"}], [])
+            except ProviderUnavailable:  # pragma: no cover - would be a regression
+                self.fail(f"HTTP {config_fault} must not be classified as an outage")
+            except ProviderError as exc:
+                self.assertIn(f"HTTP {config_fault}", str(exc))
+                self.assertIn("CITIZENS_LLM_MODEL", str(exc))
+            else:  # pragma: no cover - would be a regression
+                self.fail("a rejected request must raise ProviderError")
 
     def test_reply_shape_faults_stay_plain_provider_errors(self) -> None:
         # A malformed tool call is model behavior the planner retry loop can
