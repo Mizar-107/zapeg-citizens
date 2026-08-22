@@ -75,6 +75,30 @@ class TemplateDetectionTest(unittest.TestCase):
         self.assertEqual("simple_build", template["name"])
         self.assertEqual("watchtower", template["params"]["blueprint"])
 
+    def test_sugar_cane_phrasings_template_with_default_count(self) -> None:
+        # The live failing instruction carried no number: default is 8.
+        bare = detect_template("şeker kamışı topla")
+        self.assertIsNotNone(bare)
+        self.assertEqual("harvest_cane", bare["name"])
+        self.assertEqual(8, bare["params"]["count"])
+        counted = detect_template("12 şeker kamışı topla ve sandığa koy")
+        self.assertEqual(12, counted["params"]["count"])
+        english = detect_template("collect 20 sugar cane from the river")
+        self.assertEqual("harvest_cane", english["name"])
+        self.assertEqual(20, english["params"]["count"])
+        folded = detect_template("KAMIŞ KES")
+        self.assertEqual("harvest_cane", folded["name"])
+        stages = [stage["name"] for stage in bare["stages"]]
+        self.assertEqual(["survey", "harvest", "verify_deliver"], stages)
+        harvest = bare["stages"][1]
+        self.assertEqual("inventory_delta", harvest["advance"]["kind"])
+        self.assertEqual(["sugar_cane"], harvest["advance"]["items"])
+        # The stage text bakes in the two live failure modes: no tool asks,
+        # and never operating from inside water.
+        self.assertIn("bare", harvest["goal"])
+        self.assertIn("water", harvest["goal"])
+        self.assertIn("çapa", bare["stages"][0]["goal"])
+
     def test_freeform_goals_stay_untemplated(self) -> None:
         for goal in [
             "Sort every chest around here into categories",

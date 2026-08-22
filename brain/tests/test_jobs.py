@@ -401,8 +401,12 @@ class DurableJobTest(TempDatabaseTest, unittest.TestCase):
         started = service.start(job_payload(goal="Go chop some wood."))
         self.assertEqual("mine", started["action"]["name"])
         system = provider.calls[0][0][0]["content"]
-        self.assertIn("hand-breakable blocks can be punched", system)
-        self.assertIn("never pause for an axe", system)
+        self.assertIn("hand-harvestable: punch", system)
+        self.assertIn("never pause for an axe, shovel, shears, or hoe", system)
+        # 2026-08-21 field regressions: the planner must respect a bare-hands
+        # actor answer and must self-rescue from water before continuing.
+        self.assertIn("never repeat that tool request", system)
+        self.assertIn("standing in water", system)
         offered = {tool["function"]["name"] for tool in provider.calls[0][1]}
         self.assertIn("mine", offered)
         needs_input = next(

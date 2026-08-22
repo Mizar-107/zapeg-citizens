@@ -44,6 +44,40 @@ class HarvestPolicyTest(unittest.TestCase):
             )
         )
 
+    def test_sugar_cane_hoe_requests_are_rejected(self) -> None:
+        # Regression for the 2026-08-21 live failure: a "şeker kamışı topla"
+        # job paused asking the owner for a çapa (hoe), then re-asked after
+        # the owner answered "elinle kaz". Both asks must fault server-side.
+        fault = optional_harvest_tool_fault("şeker kamışı topla", "Bir çapa lazım")
+        self.assertEqual(HAND_HARVEST_FAULT, fault)
+        self.assertIn("hoe", fault)
+        # The repeat ask after the actor's bare-hands answer faults too.
+        self.assertIsNotNone(
+            optional_harvest_tool_fault(
+                "şeker kamışı topla", "Çapa olmadan kamış toplayamam."
+            )
+        )
+        # English hoe phrasing and folded/uppercase Turkish.
+        self.assertIsNotNone(
+            optional_harvest_tool_fault(
+                "collect 20 sugar cane", "I need a hoe to harvest sugar cane."
+            )
+        )
+        self.assertIsNotNone(
+            optional_harvest_tool_fault("KAMIŞ KES", "ÇAPAYA İHTİYACIM VAR")
+        )
+        # Crops family rides the same net.
+        self.assertIsNotNone(
+            optional_harvest_tool_fault("buğday hasat et", "Orak gerekiyor.")
+        )
+        # A pickaxe ask on a cane goal is still nonsense-tool → also faulted
+        # via the question-side punchable noun.
+        self.assertIsNotNone(
+            optional_harvest_tool_fault(
+                "taş kaz", "Şeker kamışı kırmak için makas lazım."
+            )
+        )
+
     def test_turkish_pickaxe_requirement_stays_a_real_blocker(self) -> None:
         self.assertIsNone(
             optional_harvest_tool_fault(

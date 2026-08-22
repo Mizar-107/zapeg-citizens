@@ -115,6 +115,20 @@ _GATHER_WOOD_TR = re.compile(
     r"\b(?:topla|kes|getir|kır|kir)\w*",
     re.IGNORECASE,
 )
+_HARVEST_CANE_EN = re.compile(
+    r"\b(?:gather|collect|harvest|cut|get|bring|fetch|farm)\b[^.]{0,40}?"
+    r"(?:\b(\d{1,4})\b[^.]{0,24}?)?\b(?:sugar\s*cane|reeds?)\b",
+    re.IGNORECASE,
+)
+# Count is optional in Turkish too ("şeker kamışı topla" was the live failing
+# instruction); a missing count defaults to 8. Character classes cover İ/ı/ş/s
+# spellings because detection runs on the RAW goal, not folded text.
+_HARVEST_CANE_TR = re.compile(
+    r"(?:\b(\d{1,4})\s*(?:tane\s+)?)?"
+    r"\b(?:[şs]eker\s*kam[ıi][şs]\w*|kam[ıi][şs]\w*)\b[^.]{0,40}?"
+    r"\b(?:topla|kes|getir|hasat|k[ıi]r)\w*",
+    re.IGNORECASE,
+)
 _MINE_ORE_EN = re.compile(
     r"\bmine\b[^.]{0,40}?\b(\d{1,4})\b\s*"
     r"(iron|coal|copper|gold|diamond|emerald|redstone|lapis)(?:s|es)?(?:\s+ores?)?\b",
@@ -272,6 +286,49 @@ def _gather_wood_template(count: int) -> dict[str, Any]:
     )
 
 
+def _harvest_cane_template(count: int) -> dict[str, Any]:
+    count = _clamp(count, 1, 256)
+    return _wrap(
+        "harvest_cane",
+        {"count": count},
+        [
+            _stage(
+                "survey",
+                "Check yourself with get_self_status, then scan_blocks or look_around "
+                "for 'minecraft:sugar_cane'. Sugar cane grows on sand or grass BESIDE "
+                "water: approach along dry bank blocks and never enter the water. No "
+                "tool is needed and none may be requested — sugar cane breaks "
+                "instantly with bare hands (a hoe/çapa is for tilling soil, not this).",
+                ["scan_blocks", "look_around", "mine"],
+                max_actions=6,
+            ),
+            _delta_stage(
+                "harvest",
+                f"Mine {count} NEW sugar_cane blocks from the dry bank; punching "
+                "bare-handed is correct. Break each stalk at its second block so the "
+                "base regrows, then collect the drops (mine collects its own drops; "
+                "collect_items only for leftovers). If you ever find yourself in "
+                "water, your FIRST action is moving onto the nearest dry block. The "
+                f"server advances only when confirmed inventory evidence shows {count} "
+                "newly gained sugar cane, so after mining call get_self_status to "
+                "prove the new count; if it is short, keep harvesting.",
+                ["sugar_cane"],
+                count=count,
+                max_actions=14,
+            ),
+            _stage(
+                "verify_deliver",
+                "Verify with get_self_status that the new sugar cane is in inventory "
+                "and note the exact count. If the original instruction also asked for "
+                "delivery, deposit, or crafting, do that now (goto, interact_at, "
+                "transfer, close_gui) before finishing.",
+                ["get_self_status"],
+                max_actions=10,
+            ),
+        ],
+    )
+
+
 def _mine_ore_template(ore: str, count: int) -> dict[str, Any]:
     count = _clamp(count, 1, 128)
     blocks = ORE_BLOCKS[ore]
@@ -400,6 +457,8 @@ def _explicit_template(goal: str) -> dict[str, Any] | None:
 
     if name == "gather_wood":
         return _gather_wood_template(_int_param("n", "count", default=16))
+    if name == "harvest_cane":
+        return _harvest_cane_template(_int_param("n", "count", default=8))
     if name == "mine_ore":
         ore = params.get("type", params.get("ore", "")).lower()
         if ore not in ORE_BLOCKS:
@@ -420,6 +479,12 @@ def detect_template(goal: str | None) -> dict[str, Any] | None:
     explicit = _explicit_template(goal)
     if explicit is not None:
         return explicit
+
+    match = _HARVEST_CANE_EN.search(goal) or _HARVEST_CANE_TR.search(goal)
+    if match is not None:
+        return _harvest_cane_template(
+            int(match.group(1)) if match.group(1) else 8
+        )
 
     match = _GATHER_WOOD_EN.search(goal) or _GATHER_WOOD_TR.search(goal)
     if match is not None:
